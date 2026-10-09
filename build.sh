@@ -780,7 +780,7 @@ cd "$GITHUB_WORKSPACE"
 echo "=== Téléchargement des images stock ==="
 cd "$GITHUB_WORKSPACE"
 
-curl -fLo boot-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260830/boot.img" 2>/dev/null || {
+curl -fLo boot-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260920/boot.img" 2>/dev/null || {
   echo "Fallback mkbootimg..."
   mkbootimg --kernel kernel_sources/out/arch/arm64/boot/Image \
     --ramdisk /dev/null \
@@ -794,7 +794,7 @@ curl -fLo boot-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260830/bo
     --cmdline "androidboot.hardware=kiev androidboot.selinux=permissive"
 }
 
-curl -fLo dtbo-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260830/dtbo.img" 2>/dev/null || true
+curl -fLo dtbo-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260920/dtbo.img" 2>/dev/null || true
 
 if [ -f "boot-stock.img" ]; then
   echo "=== Repack avec magiskboot ==="
