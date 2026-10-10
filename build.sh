@@ -427,15 +427,20 @@ if 'CONFIG_KSU_SECCOMP_BYPASS' in content:
     print("[i] Bypass seccomp déjà appliqué")
     exit(0)
 
-# Trouver la fonction __secure_computing
-pattern = r'(int\s+__secure_computing\s*\([^)]+\)\s*\{)'
-match = re.search(pattern, content)
+# Trouver la fonction __secure_computing + sa déclaration "int this_syscall;"
+# On cherche le pattern exact dans ton fichier :
+#   int __secure_computing(const struct seccomp_data *sd)
+#   {
+#       int mode = current->seccomp.mode;
+#       int this_syscall;
+pattern = r'(int\s+__secure_computing\s*\([^)]+\)\s*\{[^}]*?int\s+this_syscall\s*;)'
+match = re.search(pattern, content, re.DOTALL)
 
 if not match:
-    print("⚠️  __secure_computing() non trouvée dans seccomp.c — skip")
+    print("⚠️  Pattern __secure_computing + this_syscall non trouvé — skip")
     exit(0)
 
-start = match.end()
+insert_pos = match.end()
 
 bypass_code = '''
 #ifdef CONFIG_KSU
@@ -446,9 +451,9 @@ bypass_code = '''
 #endif
 '''
 
-content = content[:start] + bypass_code + content[start:]
+content = content[:insert_pos] + bypass_code + content[insert_pos:]
 path.write_text(content)
-print("[+] Bypass seccomp pour processus root ajouté dans __secure_computing()")
+print("[+] Bypass seccomp inséré après les déclarations de variables")
 PYEOF_SECCOMP_BYPASS
 
 if grep -q "CONFIG_KSU_SECCOMP_BYPASS" kernel/seccomp.c 2>/dev/null; then
