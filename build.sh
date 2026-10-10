@@ -409,8 +409,8 @@ else
     echo "✅ Fonction disable_seccomp() déjà présente dans ReSukiSU"
 fi
 
-# ==================== 3.4b. PATCH BYPASS SECCOMP POUR PROCESSUS ROOT ====================
-echo "=== Patch bypass seccomp pour processus root dans kernel/seccomp.c ==="
+# ==================== 3.4b. PATCH BYPASS SECCOMP POUR SYSCALLS KERNELSU ====================
+echo "=== Patch bypass seccomp pour syscalls KernelSU dans kernel/seccomp.c ==="
 
 python3 << 'PYEOF_SECCOMP_BYPASS'
 from pathlib import Path
@@ -428,11 +428,6 @@ if 'CONFIG_KSU_SECCOMP_BYPASS' in content:
     exit(0)
 
 # Trouver la fonction __secure_computing + sa déclaration "int this_syscall;"
-# On cherche le pattern exact dans ton fichier :
-#   int __secure_computing(const struct seccomp_data *sd)
-#   {
-#       int mode = current->seccomp.mode;
-#       int this_syscall;
 pattern = r'(int\s+__secure_computing\s*\([^)]+\)\s*\{[^}]*?int\s+this_syscall\s*;)'
 match = re.search(pattern, content, re.DOTALL)
 
@@ -442,24 +437,33 @@ if not match:
 
 insert_pos = match.end()
 
+# Bypass ciblé sur le syscall reboot avec magic KernelSU/SUSFS
 bypass_code = '''
 #ifdef CONFIG_KSU
-	/* CONFIG_KSU_SECCOMP_BYPASS : bypass seccomp pour les processus root */
-	if (current_uid().val == 0) {
-		return 0;
+	/* CONFIG_KSU_SECCOMP_BYPASS : bypass seccomp pour les syscalls KernelSU/SUSFS */
+	{
+		int __ksu_syscall = sd ? sd->nr : syscall_get_nr(current, task_pt_regs(current));
+		if (__ksu_syscall == __NR_reboot && sd) {
+			/* KernelSU utilise reboot avec magic 0xDEADBEEF */
+			if ((unsigned long)sd->args[0] == 0xDEADBEEFUL &&
+			    ((unsigned long)sd->args[1] == 0xDEADBEEFUL ||
+			     (unsigned long)sd->args[1] == 0xFAFAFAFAUL)) {
+				return 0;  /* Laisser passer le syscall KernelSU */
+			}
+		}
 	}
 #endif
 '''
 
 content = content[:insert_pos] + bypass_code + content[insert_pos:]
 path.write_text(content)
-print("[+] Bypass seccomp inséré après les déclarations de variables")
+print("[+] Bypass seccomp ciblé KernelSU inséré")
 PYEOF_SECCOMP_BYPASS
 
 if grep -q "CONFIG_KSU_SECCOMP_BYPASS" kernel/seccomp.c 2>/dev/null; then
-    echo "✅ Bypass seccomp appliqué dans kernel/seccomp.c"
+    echo "✅ Bypass seccomp KernelSU appliqué dans kernel/seccomp.c"
 else
-    echo "⚠️  Bypass seccomp non appliqué (seccomp.c peut être différent sur ce kernel)"
+    echo "⚠️  Bypass seccomp non appliqué"
 fi
 
 # ==================== 3.5. INTÉGRATION SUSFS 2.3.0 (cyberc3dr) ====================
