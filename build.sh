@@ -5,6 +5,7 @@ set -euo pipefail
 # BUILD : LineageOS 23.2 + ReSukiSU (épinglé) + SUSFS 2.3.0 (cyberc3dr)
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
+# FIX : Désactivation de SECCOMP (débloque ksud et le tactile)
 # =============================================================================
 
 echo "=== Build ReSukiSU + SUSFS pour kiev (SM8250) ==="
@@ -675,6 +676,9 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
   echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
   echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+  echo "# CONFIG_SECCOMP is not set"
+  echo "# CONFIG_SECCOMP_FILTER is not set"
+  echo "# CONFIG_HAVE_ARCH_SECCOMP_FILTER is not set"
 } >> out/.config
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
@@ -691,6 +695,25 @@ fi
 
 echo "État final :"
 grep "CONFIG_KSU_MANUAL_HOOK" out/.config || true
+
+echo "=== Vérification et forçage de CONFIG_SECCOMP (doit être désactivé) ==="
+if grep -q "^CONFIG_SECCOMP=y" out/.config; then
+    echo "⚠️  CONFIG_SECCOMP actif ! Forçage à 'not set'..."
+    sed -i 's/^CONFIG_SECCOMP=y/# CONFIG_SECCOMP is not set/' out/.config
+fi
+
+if grep -q "^CONFIG_SECCOMP_FILTER=y" out/.config; then
+    echo "⚠️  CONFIG_SECCOMP_FILTER actif ! Forçage à 'not set'..."
+    sed -i 's/^CONFIG_SECCOMP_FILTER=y/# CONFIG_SECCOMP_FILTER is not set/' out/.config
+fi
+
+if grep -q "^CONFIG_HAVE_ARCH_SECCOMP_FILTER=y" out/.config; then
+    echo "⚠️  CONFIG_HAVE_ARCH_SECCOMP_FILTER actif ! Forçage à 'not set'..."
+    sed -i 's/^CONFIG_HAVE_ARCH_SECCOMP_FILTER=y/# CONFIG_HAVE_ARCH_SECCOMP_FILTER is not set/' out/.config
+fi
+
+echo "État SECCOMP final :"
+grep "CONFIG_SECCOMP\|CONFIG_HAVE_ARCH_SECCOMP" out/.config || true
 
 # ==================== 5. PATCHES ====================
 echo "=== Patch signatures modules + tactile (APRÈS olddefconfig) ==="
