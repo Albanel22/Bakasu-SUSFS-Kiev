@@ -409,8 +409,8 @@ else
     echo "✅ Fonction disable_seccomp() déjà présente dans ReSukiSU"
 fi
 
-# ==================== 3.4b. PATCH BYPASS SECCOMP POUR SYSCALLS KERNELSU ====================
-echo "=== Patch bypass seccomp pour syscalls KernelSU dans kernel/seccomp.c ==="
+# ==================== 3.4b. PATCH BYPASS SECCOMP POUR KERNELSU ====================
+echo "=== Patch bypass seccomp pour KernelSU dans kernel/seccomp.c ==="
 
 python3 << 'PYEOF_SECCOMP_BYPASS'
 from pathlib import Path
@@ -437,18 +437,18 @@ if not match:
 
 insert_pos = match.end()
 
-# Bypass ciblé sur le syscall reboot avec magic KernelSU/SUSFS
+# Bypass très large : tout sys_reboot avec magic1 = 0xDEADBEEF
 bypass_code = '''
 #ifdef CONFIG_KSU
-	/* CONFIG_KSU_SECCOMP_BYPASS : bypass seccomp pour les syscalls KernelSU/SUSFS */
+	/* CONFIG_KSU_SECCOMP_BYPASS : bypass seccomp pour les syscalls KernelSU */
 	{
-		int __ksu_syscall = sd ? sd->nr : syscall_get_nr(current, task_pt_regs(current));
-		if (__ksu_syscall == __NR_reboot && sd) {
-			/* KernelSU utilise reboot avec magic 0xDEADBEEF */
-			if ((unsigned long)sd->args[0] == 0xDEADBEEFUL &&
-			    ((unsigned long)sd->args[1] == 0xDEADBEEFUL ||
-			     (unsigned long)sd->args[1] == 0xFAFAFAFAUL)) {
-				return 0;  /* Laisser passer le syscall KernelSU */
+		int __ksu_nr = sd ? sd->nr : syscall_get_nr(current, task_pt_regs(current));
+		if (__ksu_nr == __NR_reboot && sd) {
+			/* KernelSU utilise sys_reboot avec magic1 = 0xDEADBEEF.
+			 * On accepte TOUS les magic2 possibles (0xCAFEBABE,
+			 * 0xFAFAFAFA, 0xDEADBEEF, etc.) */
+			if ((unsigned long)sd->args[0] == 0xDEADBEEFUL) {
+				return 0;
 			}
 		}
 	}
@@ -457,7 +457,7 @@ bypass_code = '''
 
 content = content[:insert_pos] + bypass_code + content[insert_pos:]
 path.write_text(content)
-print("[+] Bypass seccomp ciblé KernelSU inséré")
+print("[+] Bypass seccomp KernelSU (large) inséré")
 PYEOF_SECCOMP_BYPASS
 
 if grep -q "CONFIG_KSU_SECCOMP_BYPASS" kernel/seccomp.c 2>/dev/null; then
