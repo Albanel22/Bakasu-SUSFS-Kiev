@@ -409,6 +409,80 @@ else
     echo "✅ Fonction disable_seccomp() déjà présente dans ReSukiSU"
 fi
 
+# ==================== 3.4b. PATCH COMPATIBILITÉ SECCOMP ====================
+echo "=== Patch de compatibilité disable_seccomp() pour CONFIG_SECCOMP=n ==="
+
+python3 << 'PYEOF_SECCOMP_FIX'
+import re
+from pathlib import Path
+
+path = Path("drivers/kernelsu/policy/app_profile.c")
+if not path.exists():
+    print("⚠️  app_profile.c introuvable, skip")
+    exit(0)
+
+content = path.read_text()
+
+if 'CONFIG_SECCOMP_DISABLED_SAFE' in content:
+    print("[i] app_profile.c déjà patché")
+else:
+    # Trouver la fonction disable_seccomp
+    pattern = r'(void\s+disable_seccomp\s*\(void\)\s*\{)'
+    match = re.search(pattern, content)
+    if not match:
+        print("[!] disable_seccomp() non trouvée")
+        exit(1)
+    
+    start_brace = match.end() - 1
+    
+    # Trouver la fermeture correspondante en comptant les accolades
+    depth = 1
+    i = start_brace + 1
+    end_brace = -1
+    while i < len(content) and depth > 0:
+        if content[i] == '{':
+            depth += 1
+        elif content[i] == '}':
+            depth -= 1
+            if depth == 0:
+                end_brace = i
+                break
+        i += 1
+    
+    if end_brace < 0:
+        print("[!] Fermeture de disable_seccomp() non trouvée")
+        exit(1)
+    
+    # Extraire le corps original
+    body = content[start_brace+1:end_brace]
+    
+    # Nouveau corps protégé
+    new_body = '''
+#ifdef CONFIG_SECCOMP
+''' + body + '''
+#else
+	/* CONFIG_SECCOMP_DISABLED_SAFE : seccomp désactivé dans le kernel, rien à faire */
+	return;
+#endif
+'''
+    content = content[:start_brace+1] + new_body + content[end_brace:]
+    path.write_text(content)
+    print("[+] disable_seccomp() patchée pour compatibilité CONFIG_SECCOMP=n")
+
+# Vérifier aussi setuid_hook.c si présent
+setuid_path = Path("drivers/kernelsu/hook/setuid_hook.c")
+if setuid_path.exists():
+    content = setuid_path.read_text()
+    if 'CONFIG_SECCOMP' not in content and 'seccomp' in content.lower():
+        print("[i] setuid_hook.c contient des refs seccomp, vérification manuelle conseillée")
+PYEOF_SECCOMP_FIX
+
+grep -q "CONFIG_SECCOMP_DISABLED_SAFE" drivers/kernelsu/policy/app_profile.c || {
+    echo "❌ Patch seccomp non appliqué"
+    exit 1
+}
+echo "✅ Patch de compatibilité seccomp appliqué"
+
 # ==================== 3.5. INTÉGRATION SUSFS 2.3.0 (cyberc3dr) ====================
 echo "=== Intégration SUSFS 2.3.0 depuis cyberc3dr ==="
 cd "$GITHUB_WORKSPACE"
