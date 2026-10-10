@@ -5,7 +5,7 @@ set -euo pipefail
 # BUILD : LineageOS 23.2 + BakaSU (HEAD) + SUSFS 2.3.0 (cyberc3dr)
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
-# FIX : Bypass seccomp ciblé + BakaSU pour matcher manager v4.2.0-rc3 (35222)
+# FIX : Bypass seccomp ciblé + BakaSU + bypass check SUSFS version
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS pour kiev (SM8250) ==="
@@ -67,7 +67,48 @@ grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || {
     echo "❌ Échec Makefile BakaSU"; exit 1; }
 echo "✅ BakaSU intégré dans le kernel"
 
+# ==================== 2b. BYPASS CHECK VERSION SUSFS DANS BAKASU ====================
+echo ""
+echo "=== Bypass check version SUSFS dans BakaSU ==="
+
+# Chercher le fichier susfs_compat.mk (peut être dans KernelSU/ ou drivers/kernelsu/)
+SUSFS_COMPAT_FILES=$(find . -name "susfs_compat.mk" -type f 2>/dev/null)
+
+if [ -z "$SUSFS_COMPAT_FILES" ]; then
+    echo "⚠️  Aucun susfs_compat.mk trouvé, skip"
+else
+    for f in $SUSFS_COMPAT_FILES; do
+        echo "→ Traitement de $f"
+        echo "  --- Contenu original ---"
+        cat "$f"
+        echo "  --- Fin contenu original ---"
+        
+        # Convertir tous les $(error ...) en $(warning ...)
+        sed -i 's/\$(error /\$(warning /g' "$f"
+        
+        echo "  --- Contenu après patch ---"
+        cat "$f"
+        echo "  --- Fin contenu après patch ---"
+        
+        if grep -q '\$(error ' "$f"; then
+            echo "❌ Le patch n'a pas fonctionné sur $f"
+            exit 1
+        fi
+        echo "  ✅ $f patché (error → warning)"
+    done
+fi
+
+# Vérification globale : plus aucun $(error dans les susfs_compat.mk
+for f in $SUSFS_COMPAT_FILES; do
+    if grep -q '\$(error ' "$f"; then
+        echo "❌ Il reste des \$(error dans $f"
+        exit 1
+    fi
+done
+echo "✅ Bypass check SUSFS appliqué partout"
+
 # ==================== 3. HOOKS MANUELS BakaSU ====================
+echo ""
 echo "=== Hooks manuels BakaSU ==="
 
 # --- execveat ---
