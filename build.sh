@@ -5,7 +5,7 @@ set -euo pipefail
 # BUILD : LineageOS 23.2 + ReSukiSU (épinglé) + SUSFS 2.3.0 (cyberc3dr)
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
-# FIX : Désactivation de SECCOMP (débloque ksud et le tactile)
+# FIX : Bypass seccomp pour processus root (au lieu de désactiver CONFIG_SECCOMP)
 # =============================================================================
 
 echo "=== Build ReSukiSU + SUSFS pour kiev (SM8250) ==="
@@ -409,79 +409,53 @@ else
     echo "✅ Fonction disable_seccomp() déjà présente dans ReSukiSU"
 fi
 
-# ==================== 3.4b. PATCH COMPATIBILITÉ SECCOMP ====================
-echo "=== Patch de compatibilité disable_seccomp() pour CONFIG_SECCOMP=n ==="
+# ==================== 3.4b. PATCH BYPASS SECCOMP POUR PROCESSUS ROOT ====================
+echo "=== Patch bypass seccomp pour processus root dans kernel/seccomp.c ==="
 
-python3 << 'PYEOF_SECCOMP_FIX'
-import re
+python3 << 'PYEOF_SECCOMP_BYPASS'
 from pathlib import Path
+import re
 
-path = Path("drivers/kernelsu/policy/app_profile.c")
+path = Path("kernel/seccomp.c")
 if not path.exists():
-    print("⚠️  app_profile.c introuvable, skip")
+    print("⚠️  kernel/seccomp.c introuvable — skip bypass seccomp")
     exit(0)
 
 content = path.read_text()
 
-if 'CONFIG_SECCOMP_DISABLED_SAFE' in content:
-    print("[i] app_profile.c déjà patché")
-else:
-    # Trouver la fonction disable_seccomp
-    pattern = r'(void\s+disable_seccomp\s*\(void\)\s*\{)'
-    match = re.search(pattern, content)
-    if not match:
-        print("[!] disable_seccomp() non trouvée")
-        exit(1)
-    
-    start_brace = match.end() - 1
-    
-    # Trouver la fermeture correspondante en comptant les accolades
-    depth = 1
-    i = start_brace + 1
-    end_brace = -1
-    while i < len(content) and depth > 0:
-        if content[i] == '{':
-            depth += 1
-        elif content[i] == '}':
-            depth -= 1
-            if depth == 0:
-                end_brace = i
-                break
-        i += 1
-    
-    if end_brace < 0:
-        print("[!] Fermeture de disable_seccomp() non trouvée")
-        exit(1)
-    
-    # Extraire le corps original
-    body = content[start_brace+1:end_brace]
-    
-    # Nouveau corps protégé
-    new_body = '''
-#ifdef CONFIG_SECCOMP
-''' + body + '''
-#else
-	/* CONFIG_SECCOMP_DISABLED_SAFE : seccomp désactivé dans le kernel, rien à faire */
-	return;
+if 'CONFIG_KSU_SECCOMP_BYPASS' in content:
+    print("[i] Bypass seccomp déjà appliqué")
+    exit(0)
+
+# Trouver la fonction __secure_computing
+pattern = r'(int\s+__secure_computing\s*\([^)]+\)\s*\{)'
+match = re.search(pattern, content)
+
+if not match:
+    print("⚠️  __secure_computing() non trouvée dans seccomp.c — skip")
+    exit(0)
+
+start = match.end()
+
+bypass_code = '''
+#ifdef CONFIG_KSU
+	/* CONFIG_KSU_SECCOMP_BYPASS : bypass seccomp pour les processus root */
+	if (current_uid().val == 0) {
+		return 0;
+	}
 #endif
 '''
-    content = content[:start_brace+1] + new_body + content[end_brace:]
-    path.write_text(content)
-    print("[+] disable_seccomp() patchée pour compatibilité CONFIG_SECCOMP=n")
 
-# Vérifier aussi setuid_hook.c si présent
-setuid_path = Path("drivers/kernelsu/hook/setuid_hook.c")
-if setuid_path.exists():
-    content = setuid_path.read_text()
-    if 'CONFIG_SECCOMP' not in content and 'seccomp' in content.lower():
-        print("[i] setuid_hook.c contient des refs seccomp, vérification manuelle conseillée")
-PYEOF_SECCOMP_FIX
+content = content[:start] + bypass_code + content[start:]
+path.write_text(content)
+print("[+] Bypass seccomp pour processus root ajouté dans __secure_computing()")
+PYEOF_SECCOMP_BYPASS
 
-grep -q "CONFIG_SECCOMP_DISABLED_SAFE" drivers/kernelsu/policy/app_profile.c || {
-    echo "❌ Patch seccomp non appliqué"
-    exit 1
-}
-echo "✅ Patch de compatibilité seccomp appliqué"
+if grep -q "CONFIG_KSU_SECCOMP_BYPASS" kernel/seccomp.c 2>/dev/null; then
+    echo "✅ Bypass seccomp appliqué dans kernel/seccomp.c"
+else
+    echo "⚠️  Bypass seccomp non appliqué (seccomp.c peut être différent sur ce kernel)"
+fi
 
 # ==================== 3.5. INTÉGRATION SUSFS 2.3.0 (cyberc3dr) ====================
 echo "=== Intégration SUSFS 2.3.0 depuis cyberc3dr ==="
@@ -750,9 +724,6 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
   echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
   echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
-  echo "# CONFIG_SECCOMP is not set"
-  echo "# CONFIG_SECCOMP_FILTER is not set"
-  echo "# CONFIG_HAVE_ARCH_SECCOMP_FILTER is not set"
 } >> out/.config
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
@@ -767,27 +738,11 @@ if ! grep -q "CONFIG_KSU_MANUAL_HOOK" out/.config; then
     echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
 fi
 
-echo "État final :"
+echo "État final KSU_MANUAL_HOOK :"
 grep "CONFIG_KSU_MANUAL_HOOK" out/.config || true
 
-echo "=== Vérification et forçage de CONFIG_SECCOMP (doit être désactivé) ==="
-if grep -q "^CONFIG_SECCOMP=y" out/.config; then
-    echo "⚠️  CONFIG_SECCOMP actif ! Forçage à 'not set'..."
-    sed -i 's/^CONFIG_SECCOMP=y/# CONFIG_SECCOMP is not set/' out/.config
-fi
-
-if grep -q "^CONFIG_SECCOMP_FILTER=y" out/.config; then
-    echo "⚠️  CONFIG_SECCOMP_FILTER actif ! Forçage à 'not set'..."
-    sed -i 's/^CONFIG_SECCOMP_FILTER=y/# CONFIG_SECCOMP_FILTER is not set/' out/.config
-fi
-
-if grep -q "^CONFIG_HAVE_ARCH_SECCOMP_FILTER=y" out/.config; then
-    echo "⚠️  CONFIG_HAVE_ARCH_SECCOMP_FILTER actif ! Forçage à 'not set'..."
-    sed -i 's/^CONFIG_HAVE_ARCH_SECCOMP_FILTER=y/# CONFIG_HAVE_ARCH_SECCOMP_FILTER is not set/' out/.config
-fi
-
-echo "État SECCOMP final :"
-grep "CONFIG_SECCOMP\|CONFIG_HAVE_ARCH_SECCOMP" out/.config || true
+echo "État SECCOMP (doit rester ACTIVÉ car Android en a besoin) :"
+grep "CONFIG_SECCOMP\b" out/.config || true
 
 # ==================== 5. PATCHES ====================
 echo "=== Patch signatures modules + tactile (APRÈS olddefconfig) ==="
