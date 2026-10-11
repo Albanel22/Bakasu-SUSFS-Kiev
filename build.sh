@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# BUILD : LineageOS 23.2 + ReSukiSU (v4.2.0-rc1) + SUSFS
+# BUILD : LineageOS 23.2 + ReSukiSU (main) + SUSFS
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
-# FIX : Commit épinglé, KPROBES off, setresuid corrigé, vérif hooks
+# MODE : Manual Hook (non-GKI)
 # IMAGES STOCK : Google Drive (build 2026-09-20)
 # =============================================================================
 
@@ -35,11 +35,10 @@ cd kernel_sources
 git log --oneline -1
 
 # ==================== 2. INTÉGRATION ReSukiSU via setup.sh officiel ====================
-echo "=== Intégration ReSukiSU via setup.sh (mode manual pour non-GKI) ==="
+echo "=== Intégration ReSukiSU via setup.sh (mode non-GKI) ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
-# Utilisation de la branche susfs-ksud pour préparer l'environnement de compilation de ksud
-curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s manual susfs-ksud
+curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s nongki
 
 # Vérification de l'intégration
 KSU_KCONFIG_OK=0
@@ -90,6 +89,7 @@ if ! grep -q "ksu_handle_execveat" fs/exec.c; then
 import re
 with open('fs/exec.c', 'r') as f:
     content = f.read()
+
 if 'ksu_handle_execveat' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
@@ -100,9 +100,11 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 				 void *argv, void *envp, int *flags);
 #endif
 '''
+    # Déclaration externe avant do_execveat_common
     pattern = r'(static int do_execveat_common\()'
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    
+
+    # Insertion dans do_execveat_common après la vérification IS_ERR(filename)
     old_code = '''	if (IS_ERR(filename))
 		return PTR_ERR(filename);'''
     new_code = '''	if (IS_ERR(filename))
@@ -117,6 +119,9 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
         print("OK: execveat")
+    else:
+        print("⚠️  execveat: pattern IS_ERR(filename) non trouvé")
+
 with open('fs/exec.c', 'w') as f:
     f.write(content)
 PYEOF
@@ -129,24 +134,46 @@ if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
 import re
 with open('kernel/sys.c', 'r') as f:
     content = f.read()
+
 if 'ksu_handle_setresuid' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif
 '''
-    pattern = r'(long __sys_setresuid\s*\()'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    
-    old_code = '''	bool ruid_new, euid_new, suid_new;'''
-    new_code = '''	bool ruid_new, euid_new, suid_new;
+    # Chercher la fonction setresuid (formes multiples)
+    found = None
+    for pat in [r'(long __sys_setresuid\s*\()',
+                r'(static int __sys_setresuid\s*\()',
+                r'(int __sys_setresuid\s*\()']:
+        if re.search(pat, content):
+            found = pat
+            break
+
+    if not found:
+        print("❌ setresuid: pattern introuvable")
+        exit(1)
+
+    content = re.sub(found, extern_decl + '\n' + r'\1', content, count=1)
+
+    # Insérer l'appel dans le corps
+    inserted = False
+    for marker in ['	bool ruid_new, euid_new, suid_new;',
+                   '	struct cred *new;']:
+        if marker in content and not inserted:
+            new_code = marker + '''
 
 #ifdef CONFIG_KSU
 	(void)ksu_handle_setresuid(ruid, euid, suid);
 #endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: setresuid")
+            content = content.replace(marker, new_code, 1)
+            inserted = True
+            print("OK: setresuid")
+            break
+
+    if not inserted:
+        print("⚠️  setresuid: marqueur d'insertion introuvable")
+
 with open('kernel/sys.c', 'w') as f:
     f.write(content)
 PYEOF
@@ -159,6 +186,7 @@ if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
 import re
 with open('fs/read_write.c', 'r') as f:
     content = f.read()
+
 if 'ksu_handle_sys_read' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
@@ -167,7 +195,7 @@ extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *c
 '''
     pattern = r'(SYSCALL_DEFINE3\(read)'
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    
+
     old_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
 {'''
     new_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
@@ -178,6 +206,9 @@ extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *c
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
         print("OK: sys_read")
+    else:
+        print("⚠️  sys_read: pattern introuvable")
+
 with open('fs/read_write.c', 'w') as f:
     f.write(content)
 PYEOF
@@ -190,6 +221,7 @@ if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
 import re
 with open('drivers/input/input.c', 'r') as f:
     content = f.read()
+
 if 'ksu_handle_input_handle_event' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
@@ -200,7 +232,7 @@ extern __attribute__((cold)) int ksu_handle_input_handle_event(
 '''
     pattern = r'(void input_event\(struct input_dev \*dev,)'
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    
+
     old_code = '''void input_event(struct input_dev *dev,
 		 unsigned int type, unsigned int code, int value)
 {
@@ -221,6 +253,9 @@ extern __attribute__((cold)) int ksu_handle_input_handle_event(
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
         print("OK: input_event")
+    else:
+        print("⚠️  input_event: pattern introuvable")
+
 with open('drivers/input/input.c', 'w') as f:
     f.write(content)
 PYEOF
@@ -254,6 +289,69 @@ if [ "$HOOKS_OK" -eq 0 ]; then
     exit 1
 fi
 echo "✅ Tous les hooks sont en place"
+
+# ==================== 3.4. PATCH app_profile.c (compat CONFIG_SECCOMP) ====================
+echo "=== Patch compatibilité disable_seccomp() ==="
+
+python3 << 'PYEOF_SECCOMP_FIX'
+import re
+from pathlib import Path
+import os
+
+candidates = ["drivers/kernelsu/policy/app_profile.c", "KernelSU/kernel/policy/app_profile.c"]
+path = None
+for c in candidates:
+    if os.path.exists(c):
+        path = Path(c)
+        break
+
+if path is None:
+    print("⚠️  app_profile.c introuvable, skip")
+    exit(0)
+
+content = path.read_text()
+
+if 'CONFIG_KSU_SECCOMP_SAFE' in content:
+    print("[i] app_profile.c déjà patché")
+    exit(0)
+
+pattern = r'(void\s+disable_seccomp\s*\(void\)\s*\{)'
+match = re.search(pattern, content)
+if not match:
+    print("[i] disable_seccomp() déjà protégée ou absente")
+    exit(0)
+
+start_brace = match.end() - 1
+depth = 1
+i = start_brace + 1
+end_brace = -1
+while i < len(content) and depth > 0:
+    if content[i] == '{':
+        depth += 1
+    elif content[i] == '}':
+        depth -= 1
+        if depth == 0:
+            end_brace = i
+            break
+    i += 1
+
+if end_brace < 0:
+    print("[!] Fermeture de disable_seccomp() non trouvée")
+    exit(1)
+
+body = content[start_brace+1:end_brace]
+new_body = '''
+#ifdef CONFIG_SECCOMP
+''' + body + '''
+#else
+	/* CONFIG_KSU_SECCOMP_SAFE : seccomp désactivé, rien à faire */
+	return;
+#endif
+'''
+content = content[:start_brace+1] + new_body + content[end_brace:]
+path.write_text(content)
+print("[+] disable_seccomp() patchée")
+PYEOF_SECCOMP_FIX
 
 # ==================== 4. CONFIGURATION ====================
 echo "=== Configuration ==="
@@ -319,6 +417,69 @@ fi
 echo "=== État final .config ==="
 grep -E "KSU_MANUAL_HOOK|KPROBES" out/.config || true
 
+# ==================== 4b. BYPASS SECCOMP CIBLÉ ====================
+echo "=== Patch bypass seccomp ciblé dans kernel/seccomp.c ==="
+
+python3 << 'PYEOF_SECCOMP_BYPASS'
+from pathlib import Path
+import re
+
+path = Path("kernel/seccomp.c")
+if not path.exists():
+    print("⚠️  kernel/seccomp.c introuvable")
+    exit(0)
+
+content = path.read_text()
+
+if 'CONFIG_KSU_SECCOMP_BYPASS' in content:
+    print("[i] Bypass seccomp déjà appliqué")
+    exit(0)
+
+pattern = r'(int\s+__secure_computing\s*\([^)]+\)\s*\{[^}]*?int\s+this_syscall\s*;)'
+match = re.search(pattern, content, re.DOTALL)
+
+if not match:
+    print("⚠️  Pattern non trouvé, skip")
+    exit(0)
+
+insert_pos = match.end()
+bypass_code = '''
+#ifdef CONFIG_KSU
+	/* CONFIG_KSU_SECCOMP_BYPASS : bypass syscalls KernelSU/SUSFS */
+	{
+		int __ksu_nr = sd ? sd->nr : syscall_get_nr(current, task_pt_regs(current));
+		if (__ksu_nr == __NR_reboot && sd) {
+			if ((unsigned long)sd->args[0] == 0xDEADBEEFUL) {
+				return 0;
+			}
+		}
+	}
+#endif
+'''
+
+content = content[:insert_pos] + bypass_code + content[insert_pos:]
+path.write_text(content)
+print("[+] Bypass seccomp ciblé inséré")
+PYEOF_SECCOMP_BYPASS
+
+if grep -q "CONFIG_KSU_SECCOMP_BYPASS" kernel/seccomp.c 2>/dev/null; then
+    echo "✅ Bypass seccomp appliqué"
+else
+    echo "⚠️  Bypass seccomp non appliqué"
+fi
+
+# ==================== 5. PATCHES ====================
+echo "=== Patch signatures modules + tactile ==="
+
+sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
+
+if ! grep -q "panel_register_notifier" techpack/display/msm/msm_drv.c; then
+    printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
+    echo "✅ Patch tactile appliqué"
+else
+    echo "⏭️  Patch tactile déjà présent"
+fi
+
 # ==================== 6. COMPILATION ====================
 echo "=== Compilation finale ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
@@ -354,7 +515,7 @@ export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
-git clone --depth=1 https://github.com/ESK-Project/ReSukiSU.git "$GITHUB_WORKSPACE/ksud-src"
+git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 
 mkdir -p .cargo
@@ -447,5 +608,6 @@ cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 
 echo "=== BUILD TERMINÉ ==="
-echo "Noyau + ksud : ReSukiSU (v4.2.0-rc1)"
+echo "Noyau + ksud : ReSukiSU (main, mode non-GKI)"
+echo "Images stock : Google Drive (build 2026-09-20)"
 ls -lh output/
