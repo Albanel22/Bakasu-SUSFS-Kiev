@@ -35,10 +35,10 @@ cd kernel_sources
 git log --oneline -1
 
 # ==================== 2. INTÉGRATION ReSukiSU via setup.sh officiel ====================
-echo "=== Intégration ReSukiSU via setup.sh (mode non-GKI) ==="
+echo "=== Intégration ReSukiSU via setup.sh ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
-curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s nongki
+curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
 
 # Vérification de l'intégration
 KSU_KCONFIG_OK=0
@@ -68,7 +68,6 @@ if [ "$KSU_MAKEFILE_OK" -eq 0 ]; then
 fi
 echo "✅ ReSukiSU intégré dans le kernel"
 
-# Détecter le chemin réel du dossier KernelSU
 if [ -d "drivers/kernelsu" ]; then
     KSU_DIR="drivers/kernelsu"
 elif [ -d "KernelSU" ]; then
@@ -90,7 +89,7 @@ import re
 with open('fs/exec.c', 'r') as f:
     content = f.read()
 
-if 'ksu_handle_execveat' not in content:
+if 'ksu_execveat_hook' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
 extern bool ksu_execveat_hook __read_mostly;
@@ -100,11 +99,17 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 				 void *argv, void *envp, int *flags);
 #endif
 '''
-    # Déclaration externe avant do_execveat_common
-    pattern = r'(static int do_execveat_common\()'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
+    # Placer la déclaration APRÈS le bloc d'includes
+    include_pattern = r'((?:#include\s+[<"][^>"]+[>"]\n)+)'
+    match = re.search(include_pattern, content)
+    if match:
+        content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
+        print("OK: extern execveat placé après les includes")
+    else:
+        content = re.sub(r'(static int do_execveat_common\()',
+                         extern_decl + '\n' + r'\1', content, count=1)
+        print("OK: extern execveat placé avant do_execveat_common")
 
-    # Insertion dans do_execveat_common après la vérification IS_ERR(filename)
     old_code = '''	if (IS_ERR(filename))
 		return PTR_ERR(filename);'''
     new_code = '''	if (IS_ERR(filename))
@@ -118,7 +123,7 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 #endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: execveat")
+        print("OK: execveat (appel inséré)")
     else:
         print("⚠️  execveat: pattern IS_ERR(filename) non trouvé")
 
@@ -128,7 +133,7 @@ PYEOF
   python3 /tmp/hook_execveat.py
 fi
 
-# --- setresuid ---
+# --- setresuid (CORRIGÉ) ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
   cat > /tmp/hook_setresuid.py << 'PYEOF'
 import re
@@ -141,38 +146,33 @@ if 'ksu_handle_setresuid' not in content:
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif
 '''
-    # Chercher la fonction setresuid (formes multiples)
-    found = None
-    for pat in [r'(long __sys_setresuid\s*\()',
-                r'(static int __sys_setresuid\s*\()',
-                r'(int __sys_setresuid\s*\()']:
-        if re.search(pat, content):
-            found = pat
-            break
+    # Placer la déclaration APRÈS les includes
+    include_pattern = r'((?:#include\s+[<"][^>"]+[>"]\n)+)'
+    match = re.search(include_pattern, content)
+    if match:
+        content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
+        print("OK: extern setresuid placé après les includes")
 
-    if not found:
-        print("❌ setresuid: pattern introuvable")
+    # Trouver la signature exacte de __sys_setresuid (kernel 4.19)
+    sig_pattern = r'(static int __sys_setresuid\s*\([^)]*\)\s*\{)'
+    sig_match = re.search(sig_pattern, content)
+
+    if not sig_match:
+        print("❌ __sys_setresuid introuvable avec le pattern static int")
+        print("   Lignes contenant 'setresuid' :")
+        for line in content.split('\n'):
+            if 'setresuid' in line and '(' in line:
+                print("   >", line.strip()[:120])
         exit(1)
 
-    content = re.sub(found, extern_decl + '\n' + r'\1', content, count=1)
-
-    # Insérer l'appel dans le corps
-    inserted = False
-    for marker in ['	bool ruid_new, euid_new, suid_new;',
-                   '	struct cred *new;']:
-        if marker in content and not inserted:
-            new_code = marker + '''
-
+    insert_pos = sig_match.end()
+    insert_code = '''
 #ifdef CONFIG_KSU
 	(void)ksu_handle_setresuid(ruid, euid, suid);
-#endif'''
-            content = content.replace(marker, new_code, 1)
-            inserted = True
-            print("OK: setresuid")
-            break
-
-    if not inserted:
-        print("⚠️  setresuid: marqueur d'insertion introuvable")
+#endif
+'''
+    content = content[:insert_pos] + insert_code + content[insert_pos:]
+    print("OK: setresuid (appel inséré au début de __sys_setresuid)")
 
 with open('kernel/sys.c', 'w') as f:
     f.write(content)
@@ -193,8 +193,10 @@ if 'ksu_handle_sys_read' not in content:
 extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
 #endif
 '''
-    pattern = r'(SYSCALL_DEFINE3\(read)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
+    include_pattern = r'((?:#include\s+[<"][^>"]+[>"]\n)+)'
+    match = re.search(include_pattern, content)
+    if match:
+        content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
 
     old_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
 {'''
@@ -230,8 +232,10 @@ extern __attribute__((cold)) int ksu_handle_input_handle_event(
 			unsigned int *type, unsigned int *code, int *value);
 #endif
 '''
-    pattern = r'(void input_event\(struct input_dev \*dev,)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
+    include_pattern = r'((?:#include\s+[<"][^>"]+[>"]\n)+)'
+    match = re.search(include_pattern, content)
+    if match:
+        content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
 
     old_code = '''void input_event(struct input_dev *dev,
 		 unsigned int type, unsigned int code, int value)
@@ -290,7 +294,7 @@ if [ "$HOOKS_OK" -eq 0 ]; then
 fi
 echo "✅ Tous les hooks sont en place"
 
-# ==================== 3.4. PATCH app_profile.c (compat CONFIG_SECCOMP) ====================
+# ==================== 3.4. PATCH app_profile.c ====================
 echo "=== Patch compatibilité disable_seccomp() ==="
 
 python3 << 'PYEOF_SECCOMP_FIX'
