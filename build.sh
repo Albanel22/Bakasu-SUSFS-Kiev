@@ -2,14 +2,17 @@
 set -euo pipefail
 
 # =============================================================================
-# BUILD : LineageOS 23.2 + BakaSU (HEAD) + SUSFS 2.3.0 (cyberc3dr)
+# BUILD : LineageOS 23.2 + BakaSU (v4.2.0-rc3 / commit 239e1e8) + SUSFS 2.3.0
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
-# FIX : Bypass seccomp ciblé + BakaSU + bypass check SUSFS version
+# FIX : Commit épinglé noyau+manager, bypass seccomp, KPROBES off, SUSFS patch
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS pour kiev (SM8250) ==="
 df -h
+
+# Commit BakaSU épinglé (v4.2.0-rc3) - même version pour noyau ET manager
+BAKASU_COMMIT="239e1e8"
 
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
 sudo apt-get clean || true
@@ -27,20 +30,23 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. INTÉGRATION BakaSU (HEAD) ====================
-echo "=== Intégration BakaSU (HEAD, sans pin) ==="
+# ==================== 2. INTÉGRATION BakaSU (commit épinglé) ====================
+echo "=== Intégration BakaSU (commit $BAKASU_COMMIT) ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu /tmp/BakaSU || true
 
-# Clone BakaSU
-git clone --depth=1 https://github.com/Baka-SU/BakaSU.git /tmp/BakaSU
+# Clone BakaSU (avec historique pour pouvoir checkout un commit précis)
+git clone https://github.com/Baka-SU/BakaSU.git /tmp/BakaSU
+cd /tmp/BakaSU
+git checkout "$BAKASU_COMMIT"
+cd "$GITHUB_WORKSPACE/kernel_sources"
 
-BAKASU_COMMIT=$(cd /tmp/BakaSU && git rev-parse HEAD)
-echo "Commit BakaSU utilisé : $BAKASU_COMMIT"
+echo "Commit BakaSU utilisé : $(cd /tmp/BakaSU && git rev-parse HEAD)"
+echo "Description : $(cd /tmp/BakaSU && git log -1 --pretty=%s)"
 
-# Utiliser le setup.sh officiel de BakaSU (chemin kernel/setup.sh)
-if wget -q --spider "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" 2>/dev/null; then
-    echo "→ Utilisation de setup.sh officiel BakaSU..."
-    curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s -- "$BAKASU_COMMIT"
+# Utiliser le setup.sh officiel de BakaSU
+if wget -q --spider "https://raw.githubusercontent.com/Baka-SU/BakaSU/$BAKASU_COMMIT/kernel/setup.sh" 2>/dev/null; then
+    echo "→ Utilisation de setup.sh officiel BakaSU (commit épinglé)..."
+    curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/$BAKASU_COMMIT/kernel/setup.sh" | bash -s -- "$BAKASU_COMMIT"
 else
     echo "→ setup.sh non trouvé, intégration manuelle..."
     cp -a /tmp/BakaSU/kernel drivers/kernelsu
@@ -71,7 +77,6 @@ echo "✅ BakaSU intégré dans le kernel"
 echo ""
 echo "=== Bypass check version SUSFS dans BakaSU ==="
 
-# Chercher le fichier susfs_compat.mk (peut être dans KernelSU/ ou drivers/kernelsu/)
 SUSFS_COMPAT_FILES=$(find . -name "susfs_compat.mk" -type f 2>/dev/null)
 
 if [ -z "$SUSFS_COMPAT_FILES" ]; then
@@ -79,16 +84,7 @@ if [ -z "$SUSFS_COMPAT_FILES" ]; then
 else
     for f in $SUSFS_COMPAT_FILES; do
         echo "→ Traitement de $f"
-        echo "  --- Contenu original ---"
-        cat "$f"
-        echo "  --- Fin contenu original ---"
-        
-        # Convertir tous les $(error ...) en $(warning ...)
         sed -i 's/\$(error /\$(warning /g' "$f"
-        
-        echo "  --- Contenu après patch ---"
-        cat "$f"
-        echo "  --- Fin contenu après patch ---"
         
         if grep -q '\$(error ' "$f"; then
             echo "❌ Le patch n'a pas fonctionné sur $f"
@@ -98,14 +94,13 @@ else
     done
 fi
 
-# Vérification globale : plus aucun $(error dans les susfs_compat.mk
 for f in $SUSFS_COMPAT_FILES; do
     if grep -q '\$(error ' "$f"; then
         echo "❌ Il reste des \$(error dans $f"
         exit 1
     fi
 done
-echo "✅ Bypass check SUSFS appliqué partout"
+echo "✅ Bypass check SUSFS appliqué"
 
 # ==================== 3. HOOKS MANUELS BakaSU ====================
 echo ""
@@ -440,7 +435,7 @@ PYEOF
 fi
 
 # ==================== 3.4. PATCH app_profile.c (compat CONFIG_SECCOMP) ====================
-echo "=== Patch compatibilité disable_seccomp() pour CONFIG_SECCOMP actif ==="
+echo "=== Patch compatibilité disable_seccomp() ==="
 
 python3 << 'PYEOF_SECCOMP_FIX'
 import re
@@ -460,7 +455,7 @@ if 'CONFIG_KSU_SECCOMP_SAFE' in content:
 pattern = r'(void\s+disable_seccomp\s*\(void\)\s*\{)'
 match = re.search(pattern, content)
 if not match:
-    print("[i] disable_seccomp() déjà protégée par #ifdef CONFIG_SECCOMP")
+    print("[i] disable_seccomp() déjà protégée")
     exit(0)
 
 start_brace = match.end() - 1
@@ -747,14 +742,24 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
 
-echo "=== Forçage de CONFIG_KSU_MANUAL_HOOK ==="
+echo "=== Forçage de CONFIG_KSU_MANUAL_HOOK et désactivation KPROBES ==="
 if grep -q "# CONFIG_KSU_MANUAL_HOOK is not set" out/.config; then
     sed -i 's/# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
 fi
 if ! grep -q "CONFIG_KSU_MANUAL_HOOK" out/.config; then
     echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
 fi
-grep "CONFIG_KSU_MANUAL_HOOK" out/.config || true
+
+# Vérification finale KPROBES
+if grep -q "^CONFIG_KPROBES=y" out/.config; then
+    echo "⚠️  KPROBES réactivé par olddefconfig, désactivation forcée..."
+    sed -i 's/^CONFIG_KPROBES=y/# CONFIG_KPROBES is not set/' out/.config
+    sed -i 's/^CONFIG_HAVE_KPROBES=y/# CONFIG_HAVE_KPROBES is not set/' out/.config
+    sed -i 's/^CONFIG_KRETPROBES=y/# CONFIG_KRETPROBES is not set/' out/.config
+fi
+
+echo "=== État final .config ==="
+grep -E "KSU_MANUAL_HOOK|KPROBES" out/.config || true
 
 # ==================== 4b. BYPASS SECCOMP CIBLÉ (supercall KernelSU) ====================
 echo "=== Patch bypass seccomp ciblé dans kernel/seccomp.c ==="
@@ -832,8 +837,8 @@ else
   exit 1
 fi
 
-# ==================== 6b. COMPILATION KSUD (BakaSU HEAD) ====================
-echo "=== Compilation de ksud (BakaSU HEAD) ==="
+# ==================== 6b. COMPILATION KSUD (MÊME COMMIT QUE NOYAU) ====================
+echo "=== Compilation de ksud (commit $BAKASU_COMMIT) ==="
 cd "$GITHUB_WORKSPACE"
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -854,8 +859,11 @@ export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
-git clone --depth=1 https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
-cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
+git clone https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
+cd "$GITHUB_WORKSPACE/ksud-src"
+git checkout "$BAKASU_COMMIT"
+echo "Commit ksud : $(git rev-parse HEAD)"
+cd userspace/ksud
 
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
@@ -879,7 +887,7 @@ if [ -z "$KSUD_BINARY" ]; then
 fi
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
 chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé (BakaSU)"
+echo "✅ ksud compilé (commit $BAKASU_COMMIT)"
 
 cd "$GITHUB_WORKSPACE"
 
@@ -954,4 +962,5 @@ cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 
 echo "=== BUILD TERMINÉ ==="
+echo "Noyau + ksud : commit $BAKASU_COMMIT (v4.2.0-rc3)"
 ls -lh output/
