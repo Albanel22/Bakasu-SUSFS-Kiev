@@ -40,7 +40,6 @@ rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
 curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
 
-# Vérification de l'intégration
 KSU_KCONFIG_OK=0
 KSU_MAKEFILE_OK=0
 
@@ -99,7 +98,6 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 				 void *argv, void *envp, int *flags);
 #endif
 '''
-    # Placer la déclaration APRÈS le bloc d'includes
     include_pattern = r'((?:#include\s+[<"][^>"]+[>"]\n)+)'
     match = re.search(include_pattern, content)
     if match:
@@ -133,7 +131,7 @@ PYEOF
   python3 /tmp/hook_execveat.py
 fi
 
-# --- setresuid (CORRIGÉ) ---
+# --- setresuid (CORRIGÉ : long __sys_setresuid) ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
   cat > /tmp/hook_setresuid.py << 'PYEOF'
 import re
@@ -146,19 +144,18 @@ if 'ksu_handle_setresuid' not in content:
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif
 '''
-    # Placer la déclaration APRÈS les includes
     include_pattern = r'((?:#include\s+[<"][^>"]+[>"]\n)+)'
     match = re.search(include_pattern, content)
     if match:
         content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
         print("OK: extern setresuid placé après les includes")
 
-    # Trouver la signature exacte de __sys_setresuid (kernel 4.19)
-    sig_pattern = r'(static int __sys_setresuid\s*\([^)]*\)\s*\{)'
+    # Kernel 4.19 utilise 'long __sys_setresuid', pas 'static int'
+    sig_pattern = r'(long __sys_setresuid\s*\([^)]*\)\s*\{)'
     sig_match = re.search(sig_pattern, content)
 
     if not sig_match:
-        print("❌ __sys_setresuid introuvable avec le pattern static int")
+        print("❌ __sys_setresuid introuvable avec le pattern 'long'")
         print("   Lignes contenant 'setresuid' :")
         for line in content.split('\n'):
             if 'setresuid' in line and '(' in line:
