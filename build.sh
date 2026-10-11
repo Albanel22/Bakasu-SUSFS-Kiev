@@ -12,7 +12,6 @@ set -euo pipefail
 echo "=== Build ReSukiSU + SUSFS pour kiev (SM8250) ==="
 df -h
 
-# IDs Google Drive des images stock (build 2026-09-20)
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
 
@@ -34,7 +33,7 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. INTÉGRATION ReSukiSU via setup.sh officiel ====================
+# ==================== 2. INTÉGRATION ReSukiSU via setup.sh ====================
 echo "=== Intégration ReSukiSU via setup.sh ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
@@ -131,7 +130,7 @@ PYEOF
   python3 /tmp/hook_execveat.py
 fi
 
-# --- setresuid (CORRIGÉ : long __sys_setresuid) ---
+# --- setresuid (insertion après déclarations) ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
   cat > /tmp/hook_setresuid.py << 'PYEOF'
 import re
@@ -150,26 +149,40 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
         content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
         print("OK: extern setresuid placé après les includes")
 
-    # Kernel 4.19 utilise 'long __sys_setresuid', pas 'static int'
     sig_pattern = r'(long __sys_setresuid\s*\([^)]*\)\s*\{)'
     sig_match = re.search(sig_pattern, content)
-
     if not sig_match:
-        print("❌ __sys_setresuid introuvable avec le pattern 'long'")
-        print("   Lignes contenant 'setresuid' :")
+        print("❌ __sys_setresuid introuvable")
         for line in content.split('\n'):
             if 'setresuid' in line and '(' in line:
                 print("   >", line.strip()[:120])
         exit(1)
 
-    insert_pos = sig_match.end()
-    insert_code = '''
-#ifdef CONFIG_KSU
+    hook_code = '''#ifdef CONFIG_KSU
 	(void)ksu_handle_setresuid(ruid, euid, suid);
 #endif
 '''
-    content = content[:insert_pos] + insert_code + content[insert_pos:]
-    print("OK: setresuid (appel inséré au début de __sys_setresuid)")
+    markers = [
+        '\tkruid = make_kuid(ns, ruid);',
+        '\tkuid_t kruid, keuid, ksuid;',
+        '\tbool ruid_new, euid_new, suid_new;',
+    ]
+
+    inserted = False
+    for marker in markers:
+        if marker in content:
+            content = content.replace(marker, marker + '\n' + hook_code, 1)
+            inserted = True
+            print("OK: setresuid (inséré après '" + marker.strip()[:50] + "')")
+            break
+
+    if not inserted:
+        print("❌ setresuid: marqueur d'insertion introuvable")
+        print("   Lignes contenant 'setresuid' ou 'kruid' :")
+        for line in content.split('\n'):
+            if 'setresuid' in line or 'kruid' in line:
+                print("   >", line.strip()[:120])
+        exit(1)
 
 with open('kernel/sys.c', 'w') as f:
     f.write(content)
