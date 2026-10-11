@@ -12,9 +12,6 @@ set -euo pipefail
 echo "=== Build ReSukiSU + SUSFS pour kiev (SM8250) ==="
 df -h
 
-# Commit ReSukiSU épinglé (v4.2.0-rc1 - version qui fonctionnait)
-RESUKISU_COMMIT="cdce8bb8"
-
 # IDs Google Drive des images stock (build 2026-09-20)
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
@@ -37,41 +34,14 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. INTÉGRATION ReSukiSU (commit épinglé) ====================
-echo "=== Intégration ReSukiSU (commit $RESUKISU_COMMIT) ==="
-rm -rf drivers/kernelsu KernelSU susfs4ksu /tmp/ReSukiSU || true
+# ==================== 2. INTÉGRATION ReSukiSU via setup.sh officiel ====================
+echo "=== Intégration ReSukiSU via setup.sh (mode manual pour non-GKI) ==="
+rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
-git clone https://github.com/ESK-Project/ReSukiSU.git /tmp/ReSukiSU
-cd /tmp/ReSukiSU
-git checkout "$RESUKISU_COMMIT"
-cd "$GITHUB_WORKSPACE/kernel_sources"
+# Utilisation de la branche susfs-ksud pour préparer l'environnement de compilation de ksud
+curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s manual susfs-ksud
 
-echo "Commit ReSukiSU utilisé : $(cd /tmp/ReSukiSU && git rev-parse HEAD)"
-echo "Description : $(cd /tmp/ReSukiSU && git log -1 --pretty=%s)"
-
-if wget -q --spider "https://raw.githubusercontent.com/ESK-Project/ReSukiSU/$RESUKISU_COMMIT/kernel/setup.sh" 2>/dev/null; then
-    echo "→ Utilisation de setup.sh officiel ReSukiSU..."
-    curl -LSs "https://raw.githubusercontent.com/ESK-Project/ReSukiSU/$RESUKISU_COMMIT/kernel/setup.sh" | bash -s -- "$RESUKISU_COMMIT"
-else
-    echo "→ setup.sh non trouvé, intégration manuelle..."
-    cp -a /tmp/ReSukiSU/kernel drivers/kernelsu
-    
-    if [ ! -f "drivers/kernelsu/Kconfig" ]; then
-        echo "❌ drivers/kernelsu/Kconfig introuvable après copie"
-        ls -la drivers/kernelsu/
-        exit 1
-    fi
-    
-    if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
-        sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-    fi
-    
-    if ! grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile; then
-        echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-    fi
-fi
-
-# Vérification intégration
+# Vérification de l'intégration
 KSU_KCONFIG_OK=0
 KSU_MAKEFILE_OK=0
 
@@ -110,11 +80,11 @@ else
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 3. HOOKS MANUELS (adaptés ReSukiSU) ====================
+# ==================== 3. HOOKS MANUELS ReSukiSU ====================
 echo ""
 echo "=== Hooks manuels ReSukiSU ==="
 
-# --- execveat (ReSukiSU style avec ksu_execveat_hook) ---
+# --- execveat ---
 if ! grep -q "ksu_handle_execveat" fs/exec.c; then
   cat > /tmp/hook_execveat.py << 'PYEOF'
 import re
@@ -153,7 +123,7 @@ PYEOF
   python3 /tmp/hook_execveat.py
 fi
 
-# --- setresuid (style ReSukiSU) ---
+# --- setresuid ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
   cat > /tmp/hook_setresuid.py << 'PYEOF'
 import re
@@ -183,7 +153,7 @@ PYEOF
   python3 /tmp/hook_setresuid.py
 fi
 
-# --- sys_read (style ReSukiSU) ---
+# --- sys_read ---
 if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
   cat > /tmp/hook_sys_read.py << 'PYEOF'
 import re
@@ -214,7 +184,7 @@ PYEOF
   python3 /tmp/hook_sys_read.py
 fi
 
-# --- input_event (style ReSukiSU avec ksu_input_hook) ---
+# --- input_event ---
 if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
   cat > /tmp/hook_input.py << 'PYEOF'
 import re
@@ -307,6 +277,7 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 {
   echo "CONFIG_KSU=y"
   echo "CONFIG_KSU_MANUAL_HOOK=y"
+  echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
   echo "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y"
   echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y"
   echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"
@@ -362,7 +333,7 @@ else
 fi
 
 # ==================== 6b. COMPILATION KSUD (ReSukiSU) ====================
-echo "=== Compilation de ksud (commit $RESUKISU_COMMIT) ==="
+echo "=== Compilation de ksud (ReSukiSU) ==="
 cd "$GITHUB_WORKSPACE"
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -383,11 +354,8 @@ export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
-git clone https://github.com/ESK-Project/ReSukiSU.git "$GITHUB_WORKSPACE/ksud-src"
-cd "$GITHUB_WORKSPACE/ksud-src"
-git checkout "$RESUKISU_COMMIT"
-echo "Commit ksud : $(git rev-parse HEAD)"
-cd userspace/ksud
+git clone --depth=1 https://github.com/ESK-Project/ReSukiSU.git "$GITHUB_WORKSPACE/ksud-src"
+cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
@@ -411,7 +379,7 @@ if [ -z "$KSUD_BINARY" ]; then
 fi
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
 chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé (commit $RESUKISU_COMMIT)"
+echo "✅ ksud compilé (ReSukiSU)"
 
 cd "$GITHUB_WORKSPACE"
 
@@ -479,5 +447,5 @@ cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 
 echo "=== BUILD TERMINÉ ==="
-echo "Noyau + ksud : commit $RESUKISU_COMMIT (ReSukiSU v4.2.0-rc1)"
+echo "Noyau + ksud : ReSukiSU (v4.2.0-rc1)"
 ls -lh output/
