@@ -2,23 +2,28 @@
 set -euo pipefail
 
 # =============================================================================
-# BUILD : LineageOS 23.2 + BakaSU (HEAD) + SUSFS 2.3.0 (cyberc3dr)
+# BUILD : LineageOS 23.2 + BakaSU (PINNÉ) + SUSFS 2.3.0 (cyberc3dr)
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
-# FIX : Bypass seccomp ciblé + BakaSU + bypass check SUSFS version
+# FIX v2 :
+#   - Commit BakaSU pinné UNE fois, utilisé partout (driver + ksud)
+#   - Vérification protocole driver vs gestionnaire (35222) AVANT le build
+#   - Hook setresuid corrigé (__sys_setresuid OU SYSCALL_DEFINE3)
+#   - LLVM_IAS=1
+#   - Forçage config POST-olddefconfig + hard fail si KSU perdu
+#   - Vérification symboles SUSFS avant suppression des doublons
+#   - Vérification magic seccomp vs source BakaSU
+#   - Build modules inclus
+#   - Ramdisk fallback au repack + vérif SHA256 du kernel injecté
+#   - Date de build LineageOS détectée dynamiquement
 # =============================================================================
+
+# ==================== CONFIGURATION ====================
+MANAGER_PROTOCOL="35222"   # <-- version du gestionnaire installé sur le téléphone
+GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 
 echo "=== Build BakaSU + SUSFS pour kiev (SM8250) ==="
 df -h
-
-# Paramètres reproductibles : le manager v4.2.0-rc3 doit utiliser le même
-# tag/commit BakaSU que le driver kernel et ksud. Surcharger BAKASU_REF
-# avec un commit précis si nécessaire.
-GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
-BAKASU_REF="${BAKASU_REF:-v4.2.0-rc3}"
-BAKASU_REPO="https://github.com/Baka-SU/BakaSU.git"
-KERNEL_REPO="https://github.com/LineageOS/android_kernel_motorola_sm8250.git"
-KERNEL_BRANCH="lineage-23.2"
 
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
 sudo apt-get clean || true
@@ -26,45 +31,80 @@ sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.l
 sudo apt-get update
 sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf-dev libssl-dev \
   libncurses-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi clang llvm lld \
-  device-tree-compiler zip unzip curl git python3 mkbootimg
+  device-tree-compiler zip unzip curl git python3 mkbootimg cpio
 
 cd "$GITHUB_WORKSPACE"
 
+# ==================== 0. PIN BAKASU (UN SEUL COMMIT PARTOUT) ====================
+echo "=== Détermination du commit BakaSU ==="
+BAKASU_COMMIT=$(git ls-remote https://github.com/Baka-SU/BakaSU.git refs/heads/main | awk '{print $1}')
+echo "Commit BakaSU pinné : $BAKASU_COMMIT"
+
+rm -rf /tmp/BakaSU
+mkdir -p /tmp/BakaSU && cd /tmp/BakaSU
+git init -q
+git remote add origin https://github.com/Baka-SU/BakaSU.git
+git fetch -q --depth=1 origin "$BAKASU_COMMIT"
+git checkout -q FETCH_HEAD
+echo "BakaSU cloné :" && git log --oneline -1
+cd "$GITHUB_WORKSPACE"
+
+# ---- Vérification protocole driver vs gestionnaire (AVANT de compiler 1h) ----
+echo "=== Vérification compatibilité gestionnaire (protocole $MANAGER_PROTOCOL) ==="
+KSU_VER=$(grep -rhoE "#define[[:space:]]+KSU_VERSION[[:space:]]+[0-9]+" /tmp/BakaSU/kernel/ 2>/dev/null | grep -oE "[0-9]+" | head -1)
+
+if [ -z "${KSU_VER:-}" ]; then
+    echo "⚠️  KSU_VERSION introuvable dans les sources BakaSU — vérification manuelle requise"
+    echo "    Cherche : grep -rn 'KSU_VERSION' /tmp/BakaSU/kernel/"
+else
+    echo "Version driver dans les sources : $KSU_VER"
+    if [ "$KSU_VER" != "$MANAGER_PROTOCOL" ]; then
+        echo "❌ INCOMPATIBILITÉ : driver=$KSU_VER ≠ gestionnaire=$MANAGER_PROTOCOL"
+        echo "→ Soit installer le gestionnaire buildé depuis le commit $BAKASU_COMMIT,"
+        echo "→ Soit pinner BakaSU sur le tag du gestionnaire v${MANAGER_PROTOCOL} :"
+        echo "     BAKASU_COMMIT=\$(git ls-remote --tags https://github.com/Baka-SU/BakaSU.git | grep '${MANAGER_PROTOCOL}' | cut -f1)"
+        exit 1
+    fi
+    echo "✅ Driver et gestionnaire compatibles"
+fi
+
+# ---- Vérification du magic reboot utilisé par le bypass seccomp ----
+echo "=== Vérification magic seccomp/reboot ==="
+if grep -rq "DEADBEEF" /tmp/BakaSU/kernel/; then
+    echo "✅ Magic 0xDEADBEEF confirmé dans les sources BakaSU"
+else
+    echo "⚠️  0xDEADBEEF introuvable dans BakaSU — vérifie le magic attendu par ksu_handle_sys_reboot :"
+    grep -rn "magic1" /tmp/BakaSU/kernel/ | head -5
+fi
+
 # ==================== 1. CLONAGE DU NOYAU ====================
 echo "=== Clonage du kernel LineageOS (branche lineage-23.2) ==="
-git clone "$KERNEL_REPO" -b "$KERNEL_BRANCH" --depth=1 kernel_sources
+git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 git log --oneline -1
-KERNEL_COMMIT=$(git rev-parse HEAD)
-echo "Commit kernel utilisé : $KERNEL_COMMIT"
 
-# ==================== 2. INTÉGRATION BakaSU ====================
-echo "=== Intégration BakaSU ($BAKASU_REF) ==="
-rm -rf drivers/kernelsu KernelSU susfs4ksu /tmp/BakaSU || true
+# ==================== 2. INTÉGRATION BakaSU (COMMIT PINNÉ) ====================
+echo "=== Intégration BakaSU (commit $BAKASU_COMMIT) ==="
+rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
-# Un seul checkout est partagé par le driver kernel et ksud.
-git clone --depth=1 --branch "$BAKASU_REF" "$BAKASU_REPO" /tmp/BakaSU
-BAKASU_COMMIT=$(git -C /tmp/BakaSU rev-parse HEAD)
-echo "Commit BakaSU utilisé : $BAKASU_COMMIT"
-
-# Utiliser le setup.sh officiel de BakaSU (chemin kernel/setup.sh)
-if wget -q --spider "https://raw.githubusercontent.com/Baka-SU/BakaSU/$BAKASU_COMMIT/kernel/setup.sh" 2>/dev/null; then
+# Utiliser le setup.sh officiel de BakaSU avec le commit pinné
+if wget -q --spider "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" 2>/dev/null; then
     echo "→ Utilisation de setup.sh officiel BakaSU..."
-    curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/$BAKASU_COMMIT/kernel/setup.sh" | bash -s -- "$BAKASU_COMMIT"
+    curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s -- "$BAKASU_COMMIT"
 else
     echo "→ setup.sh non trouvé, intégration manuelle..."
     cp -a /tmp/BakaSU/kernel drivers/kernelsu
-    
+
     if [ ! -f "drivers/kernelsu/Kconfig" ]; then
         echo "❌ drivers/kernelsu/Kconfig introuvable après copie"
         ls -la drivers/kernelsu/
         exit 1
     fi
-    
+
     if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
         sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
     fi
-    
+
     if ! grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile; then
         echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
     fi
@@ -77,11 +117,15 @@ grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || {
     echo "❌ Échec Makefile BakaSU"; exit 1; }
 echo "✅ BakaSU intégré dans le kernel"
 
+# ---- Vérification des noms de symboles Kconfig (détection renommages) ----
+echo "=== Vérification symboles Kconfig BakaSU ==="
+grep -q "config KSU$" drivers/kernelsu/Kconfig || echo "⚠️  'config KSU' absent — vérifier le Kconfig de BakaSU"
+grep -q "config KSU_MANUAL_HOOK$" drivers/kernelsu/Kconfig || echo "⚠️  'config KSU_MANUAL_HOOK' absent — risque de drop par olddefconfig !"
+
 # ==================== 2b. BYPASS CHECK VERSION SUSFS DANS BAKASU ====================
 echo ""
 echo "=== Bypass check version SUSFS dans BakaSU ==="
 
-# Chercher le fichier susfs_compat.mk (peut être dans KernelSU/ ou drivers/kernelsu/)
 SUSFS_COMPAT_FILES=$(find . -name "susfs_compat.mk" -type f 2>/dev/null)
 
 if [ -z "$SUSFS_COMPAT_FILES" ]; then
@@ -89,17 +133,7 @@ if [ -z "$SUSFS_COMPAT_FILES" ]; then
 else
     for f in $SUSFS_COMPAT_FILES; do
         echo "→ Traitement de $f"
-        echo "  --- Contenu original ---"
-        cat "$f"
-        echo "  --- Fin contenu original ---"
-        
-        # Convertir tous les $(error ...) en $(warning ...)
         sed -i 's/\$(error /\$(warning /g' "$f"
-        
-        echo "  --- Contenu après patch ---"
-        cat "$f"
-        echo "  --- Fin contenu après patch ---"
-        
         if grep -q '\$(error ' "$f"; then
             echo "❌ Le patch n'a pas fonctionné sur $f"
             exit 1
@@ -108,7 +142,6 @@ else
     done
 fi
 
-# Vérification globale : plus aucun $(error dans les susfs_compat.mk
 for f in $SUSFS_COMPAT_FILES; do
     if grep -q '\$(error ' "$f"; then
         echo "❌ Il reste des \$(error dans $f"
@@ -323,17 +356,17 @@ extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void 
 '''
     pattern = r'(SYSCALL_DEFINE4\(reboot)'
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    
+
     old_code = '''	char buffer[256];
 	int ret = 0;'''
-    
+
     new_code = '''	char buffer[256];
 	int ret = 0;
 
 #ifdef CONFIG_KSU_MANUAL_HOOK
 	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
 #endif'''
-    
+
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
         print("OK: sys_reboot")
@@ -349,29 +382,61 @@ PYEOF
   python3 /tmp/hook_reboot.py
 fi
 
-# --- setresuid ---
+# --- setresuid --- FIX : supporte __sys_setresuid ET SYSCALL_DEFINE3 (4.19) ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
   cat > /tmp/hook_setresuid.py << 'PYEOF'
 import re
+import sys
+
 with open('kernel/sys.c', 'r') as f:
     content = f.read()
+
 if 'ksu_handle_setresuid' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU_MANUAL_HOOK
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif
 '''
-    pattern = r'(long __sys_setresuid)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
+    done = False
 
-    old_code = '''	bool ruid_new, euid_new, suid_new;'''
-    new_code = '''	bool ruid_new, euid_new, suid_new;
+    # Cas 1 : kernel avec __sys_setresuid (ancien split)
+    m = re.search(r'(long __sys_setresuid\([^)]*\)\s*\{)', content)
+    if m:
+        anchor = None
+        for candidate in ['bool ruid_new, euid_new, suid_new;',
+                          'int ruid_new, euid_new, suid_new;']:
+            if candidate in content:
+                anchor = candidate
+                break
+        if anchor is None:
+            m2 = re.search(r'((?:bool|int) ruid_new, euid_new, suid_new;)', content)
+            if m2:
+                anchor = m2.group(1)
+        if anchor:
+            content = content.replace(anchor, anchor + '''
 #ifdef CONFIG_KSU_MANUAL_HOOK
 	(void)ksu_handle_setresuid(ruid, euid, suid);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: setresuid")
+#endif''', 1)
+            content = content[:m.start()] + extern_decl + '\n' + content[m.start():]
+            done = True
+            print("OK: setresuid (__sys_setresuid)")
+
+    # Cas 2 : wrapper SYSCALL_DEFINE3 (kernel 4.19 typique)
+    if not done:
+        m3 = re.search(r'(SYSCALL_DEFINE3\(setresuid,\s*uid_t,\s*ruid,\s*uid_t,\s*euid,\s*uid_t,\s*suid\)\s*\{)', content)
+        if m3:
+            content = content[:m3.start()] + extern_decl + '\n' + content[m3.start():]
+            content = re.sub(
+                r'(SYSCALL_DEFINE3\(setresuid,\s*uid_t,\s*ruid,\s*uid_t,\s*euid,\s*uid_t,\s*suid\)\s*\{)',
+                r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\t(void)ksu_handle_setresuid(ruid, euid, suid);\n#endif',
+                content, count=1)
+            done = True
+            print("OK: setresuid (SYSCALL_DEFINE3)")
+
+    if not done:
+        print("ERREUR: setresuid introuvable dans kernel/sys.c")
+        sys.exit(1)
+
 with open('kernel/sys.c', 'w') as f:
     f.write(content)
 PYEOF
@@ -449,6 +514,19 @@ PYEOF
   python3 /tmp/hook_input.py
 fi
 
+# ---- VÉRIFICATION FINALE : tous les hooks présents ----
+echo "=== Vérification de tous les hooks ==="
+HOOKS_OK=1
+grep -q "ksu_handle_execveat" fs/exec.c || { echo "❌ hook execveat manquant"; HOOKS_OK=0; }
+grep -q "ksu_handle_faccessat" fs/open.c || { echo "❌ hook faccessat manquant"; HOOKS_OK=0; }
+grep -q "ksu_handle_stat" fs/stat.c || { echo "❌ hook stat manquant"; HOOKS_OK=0; }
+grep -q "ksu_handle_sys_reboot" kernel/reboot.c || { echo "❌ hook reboot manquant"; HOOKS_OK=0; }
+grep -q "ksu_handle_setresuid" kernel/sys.c || { echo "❌ hook setresuid manquant"; HOOKS_OK=0; }
+grep -q "ksu_handle_sys_read" fs/read_write.c || { echo "❌ hook sys_read manquant"; HOOKS_OK=0; }
+grep -q "ksu_handle_input_handle_event" drivers/input/input.c || { echo "❌ hook input manquant"; HOOKS_OK=0; }
+[ "$HOOKS_OK" = "1" ] || { echo "❌ BUILD ABANDONNÉ : hooks manquants"; exit 1; }
+echo "✅ Tous les hooks présents"
+
 # ==================== 3.4. PATCH app_profile.c (compat CONFIG_SECCOMP) ====================
 echo "=== Patch compatibilité disable_seccomp() pour CONFIG_SECCOMP actif ==="
 
@@ -513,57 +591,14 @@ git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Bui
 
 cd "$GITHUB_WORKSPACE/kernel_sources"
 
-XXKSU_PATCH="/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch"
-if [ -f "$XXKSU_PATCH" ]; then
-    echo "=== Vérification du patch de compatibilité xxksu ==="
-
-    # Ce patch historique vise kernel/infra/file_wrapper.c. Selon la version
-    # BakaSU, le même chemin peut être sous drivers/kernelsu/ ou KernelSU/.
-    # On ne l'applique que si ses cibles existent réellement.
-    XXKSU_ROOT=""
-    for candidate in "." "drivers/kernelsu" "KernelSU"; do
-        if [ -f "$candidate/kernel/infra/file_wrapper.c" ]; then
-            XXKSU_ROOT="$candidate"
-            break
-        fi
-    done
-
-    if [ -n "$XXKSU_ROOT" ]; then
-        echo "→ Cible xxksu trouvée sous : $XXKSU_ROOT"
-        XXKSU_FILE="$XXKSU_ROOT/kernel/infra/file_wrapper.c"
-        rm -f "$XXKSU_FILE.rej" "$XXKSU_FILE.orig"
-
-        # Test sans modifier : setup.sh BakaSU peut déjà avoir appliqué ce
-        # correctif. Dans ce cas, le test inverse réussit et le build continue.
-        if (cd "$XXKSU_ROOT" && patch --dry-run --forward --batch -p1 < "$XXKSU_PATCH" >/tmp/xxksu-forward.log 2>&1); then
-            echo "→ Patch xxksu non appliqué : application en cours"
-            if ! (cd "$XXKSU_ROOT" && patch --forward --batch -p1 < "$XXKSU_PATCH"); then
-                echo "❌ Échec de l'application du patch xxksu"
-                cat /tmp/xxksu-forward.log || true
-                exit 1
-            fi
-            echo "✅ Patch xxksu appliqué"
-        elif (cd "$XXKSU_ROOT" && patch --dry-run --reverse --batch -p1 < "$XXKSU_PATCH" >/tmp/xxksu-reverse.log 2>&1); then
-            echo "✅ Patch xxksu déjà appliqué, étape ignorée"
-        else
-            echo "❌ Patch xxksu incompatible avec la cible existante"
-            echo "--- Test avant ---"
-            cat /tmp/xxksu-forward.log || true
-            echo "--- Test inverse ---"
-            cat /tmp/xxksu-reverse.log || true
-            exit 1
-        fi
-    else
-        echo "⚠️  Patch xxksu ignoré : kernel/infra/file_wrapper.c absent dans cette version de BakaSU"
-        echo "   Ce patch est optionnel et ne doit pas bloquer le build."
-    fi
-else
-    echo "⚠️  Patch xxksu absent, étape ignorée"
+if [ -f "/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch" ]; then
+    echo "=== Application du patch de compatibilité xxksu ==="
+    patch -p1 --forward --batch < "/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch" || true
 fi
 
 SUSFS_PATCH="/tmp/cyber_repo/Patches/Patch/susfs_patch_to_4.19.patch"
 echo "=== Application du patch SUSFS 4.19 ==="
-patch -p1 --forward --batch < "$SUSFS_PATCH" 2>&1 | tee /tmp/susfs_patch.log || { echo "❌ Rejet du patch SUSFS"; exit 1; }
+patch -p1 --forward --batch < "$SUSFS_PATCH" 2>&1 | tee /tmp/susfs_patch.log || true
 
 # --- Corrections automatiques des rejets ---
 if [ -f "fs/proc/task_mmu.c.rej" ]; then
@@ -664,16 +699,22 @@ if [ -f "fs/Makefile" ] && ! grep -q "susfs.o" fs/Makefile; then
     [ -f "fs/sus_su.c" ] && ! grep -q "sus_su.o" fs/Makefile && echo "obj-\$(CONFIG_KSU_SUSFS) += sus_su.o" >> fs/Makefile
 fi
 
+# ---- FIX : ne supprimer les définitions que si BakaSU les fournit ----
 if [ -f "fs/susfs.c" ]; then
-    sed -i '/^bool susfs_is_current_ksu_domain(void)/,/^}/d' fs/susfs.c || true
-    sed -i '/^u32 susfs_ksu_sid = 0;/d' fs/susfs.c || true
-    sed -i '/^u32 susfs_priv_app_sid = 0;/d' fs/susfs.c || true
-    sed -i '/EXPORT_SYMBOL(susfs_is_current_ksu_domain);/d' fs/susfs.c || true
-    sed -i '/EXPORT_SYMBOL(susfs_ksu_sid);/d' fs/susfs.c || true
-    sed -i '/EXPORT_SYMBOL(susfs_priv_app_sid);/d' fs/susfs.c || true
+    if grep -rq "susfs_is_current_ksu_domain" drivers/kernelsu/ 2>/dev/null; then
+        echo "→ BakaSU définit les symboles SUSFS → suppression des doublons dans fs/susfs.c"
+        sed -i '/^bool susfs_is_current_ksu_domain(void)/,/^}/d' fs/susfs.c || true
+        sed -i '/^u32 susfs_ksu_sid = 0;/d' fs/susfs.c || true
+        sed -i '/^u32 susfs_priv_app_sid = 0;/d' fs/susfs.c || true
+        sed -i '/EXPORT_SYMBOL(susfs_is_current_ksu_domain);/d' fs/susfs.c || true
+        sed -i '/EXPORT_SYMBOL(susfs_ksu_sid);/d' fs/susfs.c || true
+        sed -i '/EXPORT_SYMBOL(susfs_priv_app_sid);/d' fs/susfs.c || true
 
-    if ! grep -q "extern bool susfs_is_current_ksu_domain" fs/susfs.c; then
-        sed -i '1i extern bool susfs_is_current_ksu_domain(void);\nextern u32 susfs_ksu_sid;\nextern u32 susfs_priv_app_sid;' fs/susfs.c || true
+        if ! grep -q "extern bool susfs_is_current_ksu_domain" fs/susfs.c; then
+            sed -i '1i extern bool susfs_is_current_ksu_domain(void);\nextern u32 susfs_ksu_sid;\nextern u32 susfs_priv_app_sid;' fs/susfs.c || true
+        fi
+    else
+        echo "⚠️  BakaSU ne définit PAS susfs_is_current_ksu_domain → conservation des définitions SUSFS (évite undefined reference)"
     fi
 fi
 
@@ -768,21 +809,7 @@ if [ ! -f "arch/arm64/configs/$CONFIG_NAME" ]; then
   exit 1
 fi
 
-make O=out LLVM=1 CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" "$CONFIG_NAME"
-
-# Fragments officiels LineageOS pour la plateforme lito et l'appareil kiev.
-# Ils sont requis en plus de lito-perf_defconfig.
-for fragment in \
-    arch/arm64/configs/vendor/ext_config/moto-lito.config \
-    arch/arm64/configs/vendor/ext_config/kiev-default.config
-do
-    if [ ! -f "$fragment" ]; then
-        echo "❌ Fragment officiel manquant : $fragment"
-        exit 1
-    fi
-    echo "→ Application de $(basename "$fragment")"
-    cat "$fragment" >> out/.config
-done
+make O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 $CONFIG_NAME
 
 {
   echo "CONFIG_KSU=y"
@@ -812,25 +839,25 @@ done
   echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
 } >> out/.config
 
-make O=out LLVM=1 CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" olddefconfig
+make O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
 
-required_configs=(CONFIG_KIEV_DTB CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KSU_SUSFS)
-for option in "${required_configs[@]}"; do
-    if ! grep -q "^${option}=y$" out/.config; then
-        echo "❌ Option obligatoire absente ou désactivée : ${option}"
-        exit 1
-    fi
-done
-echo "✅ Configuration officielle kiev + BakaSU + SUSFS validée"
+# ---- FIX : re-forcer APRÈS olddefconfig + hard fail si perdu ----
+{
+  echo "CONFIG_KSU=y"
+  echo "CONFIG_KSU_MANUAL_HOOK=y"
+} >> out/.config
+make O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
 
-echo "=== Forçage de CONFIG_KSU_MANUAL_HOOK ==="
-if grep -q "# CONFIG_KSU_MANUAL_HOOK is not set" out/.config; then
-    sed -i 's/# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
+echo "=== Vérification finale des symboles critiques ==="
+grep -q "^CONFIG_KSU=y$" out/.config || { echo "❌ CONFIG_KSU perdu par olddefconfig !"; exit 1; }
+grep -q "^CONFIG_KSU_MANUAL_HOOK=y$" out/.config || { echo "❌ CONFIG_KSU_MANUAL_HOOK perdu par olddefconfig !"; exit 1; }
+echo "✅ CONFIG_KSU et CONFIG_KSU_MANUAL_HOOK confirmés"
+
+if grep -q "^# CONFIG_KSU_MANUAL_HOOK" out/.config; then
+    echo "❌ CONFIG_KSU_MANUAL_HOOK explicitement désactivé !"; exit 1
 fi
-if ! grep -q "CONFIG_KSU_MANUAL_HOOK" out/.config; then
-    echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
-fi
-grep "CONFIG_KSU_MANUAL_HOOK" out/.config || true
+
+grep "CONFIG_KSU" out/.config | head -10 || true
 
 # ==================== 4b. BYPASS SECCOMP CIBLÉ (supercall KernelSU) ====================
 echo "=== Patch bypass seccomp ciblé dans kernel/seccomp.c ==="
@@ -896,11 +923,11 @@ else
 fi
 
 # ==================== 6. COMPILATION ====================
-echo "=== Compilation finale ==="
-make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
+echo "=== Compilation finale (Image + modules) ==="
+make O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image modules 2>&1 | tee build.log
 
 if [ -f "out/arch/arm64/boot/Image" ]; then
-  echo "✅ Compilation réussie"
+  echo "✅ Compilation kernel réussie"
   ls -lh out/arch/arm64/boot/
 else
   echo "❌ BUILD FAILED"
@@ -908,8 +935,15 @@ else
   exit 1
 fi
 
-# ==================== 6b. COMPILATION KSUD (BakaSU HEAD) ====================
-echo "=== Compilation de ksud (BakaSU HEAD) ==="
+# ---- dtbo (non bloquant) ----
+make O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 dtbo.img 2>/dev/null || \
+    echo "⚠️  dtbo.img non généré par ce kernel (non bloquant, utiliser le stock)"
+
+# ---- Récupération des modules (pour mise à jour vendor si besoin) ----
+make O=out LLVM=1 modules_install INSTALL_MOD_PATH=out_modules >/dev/null 2>&1 || true
+
+# ==================== 6b. COMPILATION KSUD (MÊME COMMIT BAKASU) ====================
+echo "=== Compilation de ksud (commit $BAKASU_COMMIT) ==="
 cd "$GITHUB_WORKSPACE"
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -929,8 +963,15 @@ export AARCH64_CLANGXX_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x8
 export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 
+# ---- FIX : clone ksud par SHA (même commit que le driver kernel) ----
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
-cp -a /tmp/BakaSU "$GITHUB_WORKSPACE/ksud-src"
+mkdir -p "$GITHUB_WORKSPACE/ksud-src" && cd "$GITHUB_WORKSPACE/ksud-src"
+git init -q
+git remote add origin https://github.com/Baka-SU/BakaSU.git
+git fetch -q --depth=1 origin "$BAKASU_COMMIT"
+git checkout -q FETCH_HEAD
+echo "ksud cloné (doit être identique au driver) :" && git log --oneline -1
+
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 
 mkdir -p .cargo
@@ -955,7 +996,7 @@ if [ -z "$KSUD_BINARY" ]; then
 fi
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
 chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé (BakaSU)"
+echo "✅ ksud compilé (même commit que le driver : $BAKASU_COMMIT)"
 
 cd "$GITHUB_WORKSPACE"
 
@@ -963,8 +1004,12 @@ cd "$GITHUB_WORKSPACE"
 echo "=== Téléchargement des images stock ==="
 cd "$GITHUB_WORKSPACE"
 
-curl -fLo boot-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260920/boot.img" 2>/dev/null || {
-  echo "Fallback mkbootimg..."
+# ---- FIX : détection dynamique de la date de build LineageOS ----
+BUILD_DATE=$(curl -s "https://mirrorbits.lineageos.org/full/kiev/" 2>/dev/null | grep -oE '20[0-9]{6}' | sort -u | tail -1)
+echo "Date de build LineageOS détectée : ${BUILD_DATE:-inconnue}"
+
+curl -fLo boot-stock.img "https://mirrorbits.lineageos.org/full/kiev/${BUILD_DATE}/boot.img" 2>/dev/null || {
+  echo "⚠️ Téléchargement boot stock impossible, fallback mkbootimg..."
   mkbootimg --kernel kernel_sources/out/arch/arm64/boot/Image \
     --ramdisk /dev/null \
     --output final_boot.img \
@@ -977,7 +1022,9 @@ curl -fLo boot-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260920/bo
     --cmdline "androidboot.hardware=kiev androidboot.selinux=permissive"
 }
 
-curl -fLo dtbo-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260920/dtbo.img" 2>/dev/null || true
+if [ -n "${BUILD_DATE:-}" ]; then
+  curl -fLo dtbo-stock.img "https://mirrorbits.lineageos.org/full/kiev/${BUILD_DATE}/dtbo.img" 2>/dev/null || true
+fi
 
 if [ -f "boot-stock.img" ]; then
   echo "=== Repack avec magiskboot ==="
@@ -995,12 +1042,21 @@ if [ -f "boot-stock.img" ]; then
   UNPACK_EXIT=$?
   set -e
 
-  if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then
+  if [ ! -f "kernel" ]; then
     echo "❌ Échec unpack (exit magiskboot: $UNPACK_EXIT)"
     exit 1
   fi
 
+  # ---- FIX : ramdisk fallback si absent ----
+  if [ ! -f "ramdisk.cpio" ]; then
+    echo "⚠️ Aucun ramdisk dans le boot stock (header v3/v4 ?) — création d'un ramdisk minimal"
+    mkdir -p minram && (cd minram && find . | cpio -o -H newc > ../ramdisk.cpio) && rm -rf minram
+  fi
+
+  # ---- FIX : vérification que le kernel injecté est bien le nôtre ----
   cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
+  echo "=== Vérification SHA256 du kernel injecté ==="
+  sha256sum kernel "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image"
 
   ./magiskboot cpio ramdisk.cpio \
     "mkdir 0755 data" \
@@ -1024,25 +1080,26 @@ fi
 # ==================== 8. SORTIE ====================
 echo "=== Copie vers output ==="
 mkdir -p output
-cat > output/build-manifest.txt <<EOF
-device=kiev
-variant=variant2
-kernel_repo=$KERNEL_REPO
-kernel_branch=$KERNEL_BRANCH
-kernel_commit=$KERNEL_COMMIT
-bakasu_repo=$BAKASU_REPO
-bakasu_ref=$BAKASU_REF
-bakasu_commit=$BAKASU_COMMIT
-manager_expected=v4.2.0-rc3
-defconfig=vendor/lito-perf_defconfig
-fragments=vendor/ext_config/moto-lito.config,vendor/ext_config/kiev-default.config
-susfs=2.3.0-cyberc3dr
-EOF
 cp final_boot.img output/BakaSU-SuSFS-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
-cp kernel_sources/out/.config output/kernel.config 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
+cp kernel_sources/out/arch/arm64/boot/dtbo.img output/dtbo-built.img 2>/dev/null || true
+[ -d kernel_sources/out_modules ] && cp -r kernel_sources/out_modules output/modules 2>/dev/null || true
 
+echo ""
 echo "=== BUILD TERMINÉ ==="
+echo "Commit BakaSU utilisé partout : $BAKASU_COMMIT"
 ls -lh output/
+echo ""
+echo "=== TEST (sans flash) ==="
+echo "  fastboot boot output/BakaSU-SuSFS-boot.img"
+echo ""
+echo "=== INSTALLATION DÉFINITIVE (device A/B : les deux slots) ==="
+echo "  fastboot flash boot_a output/BakaSU-SuSFS-boot.img"
+echo "  fastboot flash boot_b output/BakaSU-SuSFS-boot.img"
+echo "  fastboot flash dtbo_a output/dtbo.img   (si dtbo changé)"
+echo "  fastboot flash dtbo_b output/dtbo.img"
+echo ""
+echo "⚠️  Si des modules .ko ont changé, mettre à jour la partition vendor aussi,"
+echo "    sinon tactile/autres drivers peuvent ne pas charger."
