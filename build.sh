@@ -530,11 +530,29 @@ if [ -f "$XXKSU_PATCH" ]; then
 
     if [ -n "$XXKSU_ROOT" ]; then
         echo "→ Cible xxksu trouvée sous : $XXKSU_ROOT"
-        if ! (cd "$XXKSU_ROOT" && patch -p1 --forward --batch < "$XXKSU_PATCH"); then
-            echo "❌ Rejet du patch xxksu sur une cible existante"
+        XXKSU_FILE="$XXKSU_ROOT/kernel/infra/file_wrapper.c"
+        rm -f "$XXKSU_FILE.rej" "$XXKSU_FILE.orig"
+
+        # Test sans modifier : setup.sh BakaSU peut déjà avoir appliqué ce
+        # correctif. Dans ce cas, le test inverse réussit et le build continue.
+        if (cd "$XXKSU_ROOT" && patch --dry-run --forward --batch -p1 < "$XXKSU_PATCH" >/tmp/xxksu-forward.log 2>&1); then
+            echo "→ Patch xxksu non appliqué : application en cours"
+            if ! (cd "$XXKSU_ROOT" && patch --forward --batch -p1 < "$XXKSU_PATCH"); then
+                echo "❌ Échec de l'application du patch xxksu"
+                cat /tmp/xxksu-forward.log || true
+                exit 1
+            fi
+            echo "✅ Patch xxksu appliqué"
+        elif (cd "$XXKSU_ROOT" && patch --dry-run --reverse --batch -p1 < "$XXKSU_PATCH" >/tmp/xxksu-reverse.log 2>&1); then
+            echo "✅ Patch xxksu déjà appliqué, étape ignorée"
+        else
+            echo "❌ Patch xxksu incompatible avec la cible existante"
+            echo "--- Test avant ---"
+            cat /tmp/xxksu-forward.log || true
+            echo "--- Test inverse ---"
+            cat /tmp/xxksu-reverse.log || true
             exit 1
         fi
-        echo "✅ Patch xxksu appliqué"
     else
         echo "⚠️  Patch xxksu ignoré : kernel/infra/file_wrapper.c absent dans cette version de BakaSU"
         echo "   Ce patch est optionnel et ne doit pas bloquer le build."
