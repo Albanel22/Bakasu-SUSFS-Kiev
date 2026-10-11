@@ -6,6 +6,7 @@ set -euo pipefail
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
 # FIX : Commit épinglé noyau+manager, bypass seccomp, KPROBES off, SUSFS patch
+# IMAGES STOCK : Google Drive (build 2026-09-20)
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS pour kiev (SM8250) ==="
@@ -14,13 +15,20 @@ df -h
 # Commit BakaSU épinglé (v4.2.0-rc3) - même version pour noyau ET manager
 BAKASU_COMMIT="239e1e8"
 
+# IDs Google Drive des images stock (build 2026-09-20)
+BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
+DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
+
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
 sudo apt-get clean || true
 sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list 2>/dev/null || true
 sudo apt-get update
 sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf-dev libssl-dev \
   libncurses-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi clang llvm lld \
-  device-tree-compiler zip unzip curl git python3 mkbootimg
+  device-tree-compiler zip unzip curl git python3 python3-pip mkbootimg
+
+# Installer gdown pour les téléchargements Google Drive
+pip3 install --quiet gdown
 
 cd "$GITHUB_WORKSPACE"
 
@@ -891,27 +899,50 @@ echo "✅ ksud compilé (commit $BAKASU_COMMIT)"
 
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 7. REPACK ====================
-echo "=== Téléchargement des images stock ==="
+# ==================== 7. REPACK (Images stock depuis Google Drive) ====================
+echo "=== Téléchargement des images stock depuis Google Drive ==="
 cd "$GITHUB_WORKSPACE"
 
-curl -fLo boot-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260920/boot.img" 2>/dev/null || {
-  echo "Fallback mkbootimg..."
-  mkbootimg --kernel kernel_sources/out/arch/arm64/boot/Image \
-    --ramdisk /dev/null \
-    --output final_boot.img \
-    --header_version 2 \
-    --pagesize 4096 \
-    --base 0x00000000 \
-    --kernel_offset 0x00008000 \
-    --ramdisk_offset 0x01000000 \
-    --tags_offset 0x00000100 \
-    --cmdline "androidboot.hardware=kiev androidboot.selinux=permissive"
-}
+# Téléchargement boot.img via gdown
+echo "→ Téléchargement boot.img (Google Drive ID: $BOOT_GDRIVE_ID)..."
+rm -f boot-stock.img
+if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
+    echo "  ✅ boot.img téléchargé : $(du -h boot-stock.img | cut -f1)"
+else
+    echo "  ❌ Échec gdown pour boot.img"
+    rm -f boot-stock.img
+fi
 
-curl -fLo dtbo-stock.img "https://mirrorbits.lineageos.org/full/kiev/20260920/dtbo.img" 2>/dev/null || true
+# Vérification de la taille du boot.img
+if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
+    echo "❌ boot-stock.img manquant ou trop petit (<50 Mo)"
+    echo "Fallback mkbootimg (image minimale, SANS ramdisk)..."
+    mkbootimg --kernel kernel_sources/out/arch/arm64/boot/Image \
+        --ramdisk /dev/null \
+        --output final_boot.img \
+        --header_version 2 \
+        --pagesize 4096 \
+        --base 0x00000000 \
+        --kernel_offset 0x00008000 \
+        --ramdisk_offset 0x01000000 \
+        --tags_offset 0x00000100 \
+        --cmdline "androidboot.hardware=kiev androidboot.selinux=permissive"
+else
+    echo "✅ boot.img OK : $(stat -c%s boot-stock.img) octets"
+fi
 
-if [ -f "boot-stock.img" ]; then
+# Téléchargement dtbo.img via gdown (optionnel)
+echo "→ Téléchargement dtbo.img (Google Drive ID: $DTBO_GDRIVE_ID)..."
+rm -f dtbo-stock.img
+if gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1; then
+    echo "  ✅ dtbo.img téléchargé : $(du -h dtbo-stock.img | cut -f1)"
+else
+    echo "  ⚠️  Échec gdown pour dtbo.img (non bloquant)"
+    rm -f dtbo-stock.img
+fi
+
+# Repack avec magiskboot si boot.img valide
+if [ -f "boot-stock.img" ] && [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -ge 50000000 ]; then
   echo "=== Repack avec magiskboot ==="
   mkdir -p repack
   cp boot-stock.img repack/boot.img
@@ -963,4 +994,5 @@ cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 
 echo "=== BUILD TERMINÉ ==="
 echo "Noyau + ksud : commit $BAKASU_COMMIT (v4.2.0-rc3)"
+echo "Images stock : Google Drive (build 2026-09-20)"
 ls -lh output/
