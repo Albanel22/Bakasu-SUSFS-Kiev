@@ -5,7 +5,7 @@ set -euo pipefail
 # BUILD : LineageOS 23.2 + BakaSU (v4.2.0-rc3 / commit 239e1e8) + SUSFS 2.3.0
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
-# FIX : Commit épinglé noyau+manager, bypass seccomp, KPROBES off, SUSFS patch
+# FIX : Commit épinglé, KPROBES off, setresuid corrigé, vérif hooks
 # IMAGES STOCK : Google Drive (build 2026-09-20)
 # =============================================================================
 
@@ -27,7 +27,6 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
   libncurses-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi clang llvm lld \
   device-tree-compiler zip unzip curl git python3 python3-pip mkbootimg
 
-# Installer gdown pour les téléchargements Google Drive
 pip3 install --quiet gdown
 
 cd "$GITHUB_WORKSPACE"
@@ -42,7 +41,6 @@ git log --oneline -1
 echo "=== Intégration BakaSU (commit $BAKASU_COMMIT) ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu /tmp/BakaSU || true
 
-# Clone BakaSU (avec historique pour pouvoir checkout un commit précis)
 git clone https://github.com/Baka-SU/BakaSU.git /tmp/BakaSU
 cd /tmp/BakaSU
 git checkout "$BAKASU_COMMIT"
@@ -51,7 +49,6 @@ cd "$GITHUB_WORKSPACE/kernel_sources"
 echo "Commit BakaSU utilisé : $(cd /tmp/BakaSU && git rev-parse HEAD)"
 echo "Description : $(cd /tmp/BakaSU && git log -1 --pretty=%s)"
 
-# Utiliser le setup.sh officiel de BakaSU
 if wget -q --spider "https://raw.githubusercontent.com/Baka-SU/BakaSU/$BAKASU_COMMIT/kernel/setup.sh" 2>/dev/null; then
     echo "→ Utilisation de setup.sh officiel BakaSU (commit épinglé)..."
     curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/$BAKASU_COMMIT/kernel/setup.sh" | bash -s -- "$BAKASU_COMMIT"
@@ -74,12 +71,45 @@ else
     fi
 fi
 
-# Vérification intégration
-grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || {
-    echo "❌ Échec Kconfig BakaSU"; exit 1; }
-grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || {
-    echo "❌ Échec Makefile BakaSU"; exit 1; }
+# Vérification intégration — accepter les deux emplacements possibles
+KSU_KCONFIG_OK=0
+KSU_MAKEFILE_OK=0
+
+if grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig 2>/dev/null; then
+    KSU_KCONFIG_OK=1
+elif grep -q 'source "KernelSU/kernel/Kconfig"' drivers/Kconfig 2>/dev/null; then
+    KSU_KCONFIG_OK=1
+fi
+
+if grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile 2>/dev/null; then
+    KSU_MAKEFILE_OK=1
+elif grep -q 'obj-$(CONFIG_KSU) += KernelSU/' drivers/Makefile 2>/dev/null; then
+    KSU_MAKEFILE_OK=1
+fi
+
+if [ "$KSU_KCONFIG_OK" -eq 0 ]; then
+    echo "❌ Échec Kconfig BakaSU"
+    grep -n "KSU" drivers/Kconfig | head -10
+    exit 1
+fi
+if [ "$KSU_MAKEFILE_OK" -eq 0 ]; then
+    echo "❌ Échec Makefile BakaSU"
+    grep -n "KSU" drivers/Makefile | head -10
+    exit 1
+fi
 echo "✅ BakaSU intégré dans le kernel"
+
+# Détecter le chemin réel du dossier KernelSU
+if [ -d "drivers/kernelsu" ]; then
+    KSU_DIR="drivers/kernelsu"
+elif [ -d "KernelSU" ]; then
+    KSU_DIR="KernelSU"
+else
+    echo "❌ Impossible de trouver le dossier KernelSU après setup"
+    find . -maxdepth 3 -name "Kconfig" -path "*KSU*" -o -name "Kconfig" -path "*kernelsu*" | head
+    exit 1
+fi
+echo "KSU_DIR détecté : $KSU_DIR"
 
 # ==================== 2b. BYPASS CHECK VERSION SUSFS DANS BAKASU ====================
 echo ""
@@ -342,29 +372,68 @@ PYEOF
   python3 /tmp/hook_reboot.py
 fi
 
-# --- setresuid ---
+# --- setresuid (CORRIGÉ pour kernel 4.19) ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
   cat > /tmp/hook_setresuid.py << 'PYEOF'
 import re
 with open('kernel/sys.c', 'r') as f:
     content = f.read()
-if 'ksu_handle_setresuid' not in content:
-    extern_decl = '''
+
+if 'ksu_handle_setresuid' in content:
+    print("[i] setresuid déjà patché")
+    exit(0)
+
+extern_decl = '''
 #ifdef CONFIG_KSU_MANUAL_HOOK
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif
 '''
-    pattern = r'(long __sys_setresuid)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
 
-    old_code = '''	bool ruid_new, euid_new, suid_new;'''
-    new_code = '''	bool ruid_new, euid_new, suid_new;
-#ifdef CONFIG_KSU_MANUAL_HOOK
-	(void)ksu_handle_setresuid(ruid, euid, suid);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: setresuid")
+# Chercher la fonction setresuid dans ses différentes formes
+found_pattern = None
+for pat in [r'(static int __sys_setresuid\s*\()',
+            r'(long __sys_setresuid\s*\()',
+            r'(int __sys_setresuid\s*\()',
+            r'(SYSCALL_DEFINE3\(setresuid)']:
+    if re.search(pat, content):
+        found_pattern = pat
+        break
+
+if not found_pattern:
+    print("❌ Pattern setresuid INTROUVABLE dans kernel/sys.c")
+    print("   Fonctions contenant 'setresuid' :")
+    for line in content.split('\n'):
+        if 'setresuid' in line:
+            print("   >", line.strip()[:100])
+    exit(1)
+
+content = re.sub(found_pattern, extern_decl + '\n' + r'\1', content, count=1)
+
+# Insérer l'appel dans le corps de la fonction (plusieurs variantes possibles)
+inserted = False
+for old in ['	bool ruid_new, euid_new, suid_new;',
+            '	int retval;\n	bool ruid_new, euid_new, suid_new;',
+            '	struct cred *new;',
+            '	bool ruid_new, euid_new, suid_new;\n	int retval;']:
+    if old in content and not inserted:
+        new_code = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\t(void)ksu_handle_setresuid(ruid, euid, suid);\n#endif\n' + old
+        content = content.replace(old, new_code, 1)
+        inserted = True
+        print("OK: setresuid (corps: " + old.strip()[:40] + "...)")
+        break
+
+if not inserted:
+    # Fallback : insérer juste après la première accolade ouvrante de la fonction
+    m = re.search(r'((?:static int|long|int) __sys_setresuid[^{]*\{)', content)
+    if m:
+        content = content[:m.end()] + '\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\t(void)ksu_handle_setresuid(ruid, euid, suid);\n#endif\n' + content[m.end():]
+        inserted = True
+        print("OK: setresuid (fallback post-accolade)")
+
+if not inserted:
+    print("❌ Impossible d'insérer l'appel setresuid dans le corps")
+    exit(1)
+
 with open('kernel/sys.c', 'w') as f:
     f.write(content)
 PYEOF
@@ -442,15 +511,57 @@ PYEOF
   python3 /tmp/hook_input.py
 fi
 
+# ==================== 3.3. VÉRIFICATION FINALE DES HOOKS ====================
+echo ""
+echo "=== Vérification finale des hooks ==="
+HOOKS_OK=1
+
+check_hook() {
+    local fn="$1"
+    local file="$2"
+    if grep -q "$fn" "$file" 2>/dev/null; then
+        echo "  ✅ $fn présent dans $file"
+    else
+        echo "  ❌ $fn MANQUANT dans $file"
+        HOOKS_OK=0
+    fi
+}
+
+check_hook "ksu_handle_execveat"          "fs/exec.c"
+check_hook "ksu_handle_faccessat"         "fs/open.c"
+check_hook "ksu_handle_stat"              "fs/stat.c"
+check_hook "ksu_handle_newfstat_ret"      "fs/stat.c"
+check_hook "ksu_handle_sys_reboot"        "kernel/reboot.c"
+check_hook "ksu_handle_setresuid"         "kernel/sys.c"
+check_hook "ksu_handle_sys_read"          "fs/read_write.c"
+check_hook "ksu_handle_input_handle_event" "drivers/input/input.c"
+
+if [ "$HOOKS_OK" -eq 0 ]; then
+    echo ""
+    echo "❌ ERREUR CRITIQUE : Des hooks sont manquants."
+    echo "Le pilote KernelSU ne fonctionnera pas sans eux."
+    echo "Corrige les patterns Python avant de continuer."
+    exit 1
+fi
+echo "✅ Tous les hooks sont en place"
+
 # ==================== 3.4. PATCH app_profile.c (compat CONFIG_SECCOMP) ====================
 echo "=== Patch compatibilité disable_seccomp() ==="
 
 python3 << 'PYEOF_SECCOMP_FIX'
 import re
 from pathlib import Path
+import os
 
-path = Path("drivers/kernelsu/policy/app_profile.c")
-if not path.exists():
+# Chercher app_profile.c dans le bon dossier KSU
+candidates = ["drivers/kernelsu/policy/app_profile.c", "KernelSU/kernel/policy/app_profile.c"]
+path = None
+for c in candidates:
+    if os.path.exists(c):
+        path = Path(c)
+        break
+
+if path is None:
     print("⚠️  app_profile.c introuvable, skip")
     exit(0)
 
@@ -507,8 +618,8 @@ git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Bui
 cd "$GITHUB_WORKSPACE/kernel_sources"
 
 if [ -f "/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch" ]; then
-    echo "=== Application du patch de compatibilité xxksu ==="
-    patch -p1 --forward --batch < "/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch" || true
+    echo "=== Application du patch de compatibilité xxksu (best-effort) ==="
+    patch -p1 --forward --batch < "/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch" 2>&1 | head -20 || true
 fi
 
 SUSFS_PATCH="/tmp/cyber_repo/Patches/Patch/susfs_patch_to_4.19.patch"
@@ -646,8 +757,9 @@ if 'extern bool susfs_is_current_ksu_domain' not in content:
 with open('fs/namespace.c', 'w') as f: f.write(content)
 PYEOF
 
-if [ -f "drivers/kernelsu/Kconfig" ] && ! grep -q "KSU_SUSFS" drivers/kernelsu/Kconfig; then
-    cat >> drivers/kernelsu/Kconfig << 'KCONFIG_EOF'
+KSU_KCONFIG_FILE="$KSU_DIR/Kconfig"
+if [ -f "$KSU_KCONFIG_FILE" ] && ! grep -q "KSU_SUSFS" "$KSU_KCONFIG_FILE"; then
+    cat >> "$KSU_KCONFIG_FILE" << 'KCONFIG_EOF'
 menuconfig KSU_SUSFS
 	bool "KernelSU SUSFS support"
 	depends on KSU
@@ -758,7 +870,6 @@ if ! grep -q "CONFIG_KSU_MANUAL_HOOK" out/.config; then
     echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
 fi
 
-# Vérification finale KPROBES
 if grep -q "^CONFIG_KPROBES=y" out/.config; then
     echo "⚠️  KPROBES réactivé par olddefconfig, désactivation forcée..."
     sed -i 's/^CONFIG_KPROBES=y/# CONFIG_KPROBES is not set/' out/.config
@@ -769,7 +880,7 @@ fi
 echo "=== État final .config ==="
 grep -E "KSU_MANUAL_HOOK|KPROBES" out/.config || true
 
-# ==================== 4b. BYPASS SECCOMP CIBLÉ (supercall KernelSU) ====================
+# ==================== 4b. BYPASS SECCOMP CIBLÉ ====================
 echo "=== Patch bypass seccomp ciblé dans kernel/seccomp.c ==="
 
 python3 << 'PYEOF_SECCOMP_BYPASS'
@@ -845,7 +956,7 @@ else
   exit 1
 fi
 
-# ==================== 6b. COMPILATION KSUD (MÊME COMMIT QUE NOYAU) ====================
+# ==================== 6b. COMPILATION KSUD ====================
 echo "=== Compilation de ksud (commit $BAKASU_COMMIT) ==="
 cd "$GITHUB_WORKSPACE"
 
@@ -899,11 +1010,10 @@ echo "✅ ksud compilé (commit $BAKASU_COMMIT)"
 
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 7. REPACK (Images stock depuis Google Drive) ====================
+# ==================== 7. REPACK (Images stock Google Drive) ====================
 echo "=== Téléchargement des images stock depuis Google Drive ==="
 cd "$GITHUB_WORKSPACE"
 
-# Téléchargement boot.img via gdown
 echo "→ Téléchargement boot.img (Google Drive ID: $BOOT_GDRIVE_ID)..."
 rm -f boot-stock.img
 if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
@@ -913,7 +1023,6 @@ else
     rm -f boot-stock.img
 fi
 
-# Vérification de la taille du boot.img
 if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
     echo "❌ boot-stock.img manquant ou trop petit (<50 Mo)"
     echo "Fallback mkbootimg (image minimale, SANS ramdisk)..."
@@ -931,7 +1040,6 @@ else
     echo "✅ boot.img OK : $(stat -c%s boot-stock.img) octets"
 fi
 
-# Téléchargement dtbo.img via gdown (optionnel)
 echo "→ Téléchargement dtbo.img (Google Drive ID: $DTBO_GDRIVE_ID)..."
 rm -f dtbo-stock.img
 if gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1; then
@@ -941,7 +1049,6 @@ else
     rm -f dtbo-stock.img
 fi
 
-# Repack avec magiskboot si boot.img valide
 if [ -f "boot-stock.img" ] && [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -ge 50000000 ]; then
   echo "=== Repack avec magiskboot ==="
   mkdir -p repack
