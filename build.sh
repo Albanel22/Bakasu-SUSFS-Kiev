@@ -513,9 +513,34 @@ git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Bui
 
 cd "$GITHUB_WORKSPACE/kernel_sources"
 
-if [ -f "/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch" ]; then
-    echo "=== Application du patch de compatibilité xxksu ==="
-    patch -p1 --forward --batch < "/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch" || { echo "❌ Rejet du patch xxksu"; exit 1; }
+XXKSU_PATCH="/tmp/cyber_repo/Patches/Patch/xxksu_fix_compat.patch"
+if [ -f "$XXKSU_PATCH" ]; then
+    echo "=== Vérification du patch de compatibilité xxksu ==="
+
+    # Ce patch historique vise kernel/infra/file_wrapper.c. Selon la version
+    # BakaSU, le même chemin peut être sous drivers/kernelsu/ ou KernelSU/.
+    # On ne l'applique que si ses cibles existent réellement.
+    XXKSU_ROOT=""
+    for candidate in "." "drivers/kernelsu" "KernelSU"; do
+        if [ -f "$candidate/kernel/infra/file_wrapper.c" ]; then
+            XXKSU_ROOT="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$XXKSU_ROOT" ]; then
+        echo "→ Cible xxksu trouvée sous : $XXKSU_ROOT"
+        if ! (cd "$XXKSU_ROOT" && patch -p1 --forward --batch < "$XXKSU_PATCH"); then
+            echo "❌ Rejet du patch xxksu sur une cible existante"
+            exit 1
+        fi
+        echo "✅ Patch xxksu appliqué"
+    else
+        echo "⚠️  Patch xxksu ignoré : kernel/infra/file_wrapper.c absent dans cette version de BakaSU"
+        echo "   Ce patch est optionnel et ne doit pas bloquer le build."
+    fi
+else
+    echo "⚠️  Patch xxksu absent, étape ignorée"
 fi
 
 SUSFS_PATCH="/tmp/cyber_repo/Patches/Patch/susfs_patch_to_4.19.patch"
