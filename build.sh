@@ -18,13 +18,13 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE DU NOYAU ====================
+# ==================== 1. CLONAGE ====================
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. INTÉGRATION BakaSU ====================
-echo "=== Intégration BakaSU via setup.sh ==="
+# ==================== 2. BakaSU ====================
+echo "=== Intégration BakaSU ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
@@ -33,12 +33,12 @@ if [ -d "drivers/kernelsu" ]; then
 elif [ -d "KernelSU" ]; then
     KSU_DIR="KernelSU"
 else
-    echo "❌ Impossible de trouver le dossier KernelSU"; exit 1
+    echo "❌ KernelSU introuvable"; exit 1
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 3. INTÉGRATION SUSFS ====================
-echo "=== Intégration SUSFS depuis cyberc3dr ==="
+# ==================== 3. SUSFS ====================
+echo "=== Intégration SUSFS ==="
 cd "$GITHUB_WORKSPACE"
 rm -rf /tmp/cyber_repo
 git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Build.git /tmp/cyber_repo
@@ -65,7 +65,7 @@ fi
 echo "✅ SUSFS intégré"
 
 # ==================== 3b. FIX warnings ====================
-for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
+for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c; do
     if [ -f "$f" ]; then
         sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
     fi
@@ -73,33 +73,20 @@ done
 export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=unused-but-set-variable"
 echo "✅ KCFLAGS exporté"
 
-# ==================== 3c. INJECTION DES DÉCLARATIONS SUSFS ====================
-echo ""
-echo "=== Injection des déclarations SUSFS manquantes ==="
+# ==================== 3c. DÉCLARATIONS EXTERNES ====================
+echo "=== Injection déclarations externes SUSFS ==="
 
 python3 << 'PYEOF_SUSFS_DECL'
 from pathlib import Path
 
 decl_super = '''
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs_def.h>
-#endif
-
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 extern bool susfs_is_current_ksu_domain(void);
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-
-#ifndef DEFAULT_KSU_MNT_MINOR_DEV
-#define DEFAULT_KSU_MNT_MINOR_DEV (1 << 12)
 #endif
-#endif /* CONFIG_KSU_SUSFS_SUS_MOUNT */
 '''
 
 decl_ns = '''
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs_def.h>
-#endif
-
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 extern bool susfs_is_current_ksu_domain(void);
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
@@ -107,52 +94,58 @@ extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
 #ifndef CL_COPY_MNT_NS
 #define CL_COPY_MNT_NS BIT(25)
 #endif
-#ifndef DEFAULT_KSU_MNT_ID
-#define DEFAULT_KSU_MNT_ID (1 << 20)
 #endif
-#ifndef DEFAULT_KSU_MNT_GROUP_ID
-#define DEFAULT_KSU_MNT_GROUP_ID 200000
-#endif
-#ifndef DEFAULT_KSU_MNT_MINOR_DEV
-#define DEFAULT_KSU_MNT_MINOR_DEV (1 << 12)
-#endif
-#endif /* CONFIG_KSU_SUSFS_SUS_MOUNT */
 '''
 
 def force_inject(filepath, decl, anchor):
     p = Path(filepath)
-    if not p.exists():
-        print(f"❌ {filepath} : introuvable"); return
+    if not p.exists(): return
     content = p.read_text()
     if 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' in content[:5000]:
-        print(f"[i] {filepath} : extern déjà en tête"); return
+        print(f"[i] {filepath} : déjà patché"); return
     if anchor not in content:
-        print(f"❌ {filepath} : ancre '{anchor}' introuvable !")
-        for i, l in enumerate(content.split('\n')[:10], 1):
-            print(f"    L{i}: {l[:80]}")
-        return
+        print(f"❌ {filepath} : ancre introuvable"); return
     content = content.replace(anchor, anchor + '\n' + decl, 1)
     p.write_text(content)
-    print(f"✅ {filepath} : déclarations insérées après '{anchor}'")
+    print(f"✅ {filepath} : déclarations insérées")
 
 force_inject("fs/super.c", decl_super, '#include "internal.h"')
-
-if Path("fs/namespace.c").exists():
-    content_ns = Path("fs/namespace.c").read_text()
-    if '#include "internal.h"' in content_ns:
-        force_inject("fs/namespace.c", decl_ns, '#include "internal.h"')
-    elif '#include "pnode.h"' in content_ns:
-        force_inject("fs/namespace.c", decl_ns, '#include "pnode.h"')
-
-print()
-print("=== Vérification finale ===")
-for f in ["fs/super.c", "fs/namespace.c"]:
-    p = Path(f)
-    if p.exists():
-        c = p.read_text()[:5000]
-        ext = 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' in c
-        print(f"  {'✅' if ext else '❌'} {f} : extern en tête = {ext}")
+force_inject("fs/namespace.c", decl_ns, '#include "internal.h"')
 PYEOF_SUSFS_DECL
+
+# ==================== 3d. FIX INCLUDE MANQUANT fs/stat.c (BUG CYBERC3DR) ====================
+echo ""
+echo "=== Fix bug cyberc3dr : include manquant dans fs/stat.c ==="
+
+python3 << 'PYEOF_STAT_FIX'
+from pathlib import Path
+
+p = Path("fs/stat.c")
+if not p.exists():
+    print("❌ fs/stat.c introuvable")
+    exit(0)
+
+content = p.read_text()
+
+if '#include <linux/susfs_def.h>' in content:
+    print("[i] fs/stat.c : include déjà présent")
+else:
+    anchor = '#include <asm/unistd.h>'
+    if anchor in content:
+        content = content.replace(
+            anchor,
+            anchor + '\n\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif',
+            1
+        )
+        p.write_text(content)
+        print("✅ fs/stat.c : include inséré après <asm/unistd.h>")
+    else:
+        print("❌ ancre '<asm/unistd.h>' introuvable")
+
+c = p.read_text()
+for sym in ['susfs_def.h', 'susfs_is_current_app_uid', 'STATX_SUS_KSTAT', 'STATX_SUS_KSTAT_FUSE']:
+    print(f"  {'✅' if sym in c else '❌'} {sym}")
+PYEOF_STAT_FIX
 
 # ==================== 4. NEUTRALISATION ====================
 echo ""
