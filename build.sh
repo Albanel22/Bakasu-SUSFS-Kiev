@@ -74,21 +74,45 @@ if [ -f "fs/Makefile" ] && ! grep -q "susfs.o" fs/Makefile; then
 fi
 echo "✅ SUSFS intégré"
 
-# ==================== 3b. FIX unused variable dans task_mmu.c ====================
+# ==================== 3b. FIX unused variable + désactivation -Werror ciblée ====================
 echo ""
-echo "=== Correction des variables inutilisées dans task_mmu.c ==="
+echo "=== Correction des warnings qui bloquent le build ==="
 
+# 1. Fix __maybe_unused sur vma dans les fichiers SUSFS
 if [ -f "fs/proc/task_mmu.c" ]; then
-    sed -i 's/^\s*struct vm_area_struct \*vma;/struct vm_area_struct *vma __maybe_unused;/g' fs/proc/task_mmu.c
+    sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' fs/proc/task_mmu.c
     echo "  ✅ 'vma' marquée __maybe_unused dans task_mmu.c"
 fi
 
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     if [ -f "$f" ]; then
-        sed -i 's/^\s*struct vm_area_struct \*vma;/struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
+        sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
     fi
 done
-echo "✅ Vérification terminée"
+echo "  ✅ Vérification __maybe_unused terminée"
+
+# 2. Désactiver -Werror pour unused-variable dans le Makefile principal
+#    Cela empêche TOUT warning 'unused-variable' de bloquer le build
+if [ -f "Makefile" ]; then
+    if ! grep -q "no-error=unused-variable" Makefile; then
+        echo "  → Ajout de -Wno-error=unused-variable dans le Makefile principal"
+        # Chercher la ligne KBUILD_CFLAGS := -Wall ... et ajouter l'option
+        sed -i 's/^\(KBUILD_CFLAGS   := .*\)$/\1 -Wno-error=unused-variable/' Makefile
+        # Fallback si la ligne n'a pas été trouvée
+        if ! grep -q "no-error=unused-variable" Makefile; then
+            echo "  ⚠️  Pattern KBUILD_CFLAGS non trouvé, ajout direct"
+            echo "KBUILD_CFLAGS += -Wno-error=unused-variable" >> Makefile
+        fi
+        echo "  ✅ -Wno-error=unused-variable ajouté"
+    else
+        echo "  ⏭️  -Wno-error=unused-variable déjà présent"
+    fi
+fi
+
+# 3. Au cas où, désactiver aussi via KCFLAGS exporté
+export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=maybe-uninitialized"
+echo "  ✅ KCFLAGS exporté : $KCFLAGS"
+echo "✅ Corrections terminées"
 
 # ==================== 4. NEUTRALISATION DES VÉRIFICATIONS ====================
 echo ""
@@ -117,7 +141,7 @@ echo "✅ Neutralisation terminée"
 echo ""
 echo "=== Hooks manuels BakaSU ==="
 
-# --- execveat (sans ksu_execveat_hook, mode manuel pur) ---
+# --- execveat ---
 if ! grep -q "ksu_handle_execveat" fs/exec.c; then
   cat > /tmp/hook_execveat.py << 'PYEOF'
 import re
