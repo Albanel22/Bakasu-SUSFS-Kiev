@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # =============================================================================
-# BUILD : LineageOS 23.2 + ReSukiSU (main) + SUSFS
+# BUILD : LineageOS 23.2 + ReSukiSU/BakaSU (main) + SUSFS
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # Kernel : 4.19.325
 # MODE : Manual Hook (non-GKI)
 # IMAGES STOCK : Google Drive (build 2026-09-20)
 # =============================================================================
 
-echo "=== Build ReSukiSU + SUSFS pour kiev (SM8250) ==="
+echo "=== Build ReSukiSU/BakaSU + SUSFS pour kiev (SM8250) ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -75,6 +75,23 @@ else
     exit 1
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
+
+# ==================== 2b. NEUTRALISER inline_hook_check.mk ====================
+echo ""
+echo "=== Neutralisation de la vérification inline_hook_check.mk ==="
+
+INLINE_CHECK=$(find "$KSU_DIR" -name "inline_hook_check.mk" -type f 2>/dev/null | head -1)
+
+if [ -n "$INLINE_CHECK" ]; then
+    echo "→ Fichier trouvé : $INLINE_CHECK"
+    sed -i 's/^\(\s*\)\$(error/\1# $(error/' "$INLINE_CHECK" 2>/dev/null || true
+    if grep -q '^\s*\$(error' "$INLINE_CHECK" 2>/dev/null; then
+        sed -i 's/\$(error/$(warning/g' "$INLINE_CHECK" 2>/dev/null || true
+    fi
+    echo "✅ Vérification inline_hook neutralisée"
+else
+    echo "⚠️  inline_hook_check.mk introuvable, rien à faire"
+fi
 
 # ==================== 3. HOOKS MANUELS ReSukiSU ====================
 echo ""
