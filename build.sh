@@ -102,10 +102,6 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
     if match:
         content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
         print("OK: extern execveat placé après les includes")
-    else:
-        content = re.sub(r'(static int do_execveat_common\()',
-                         extern_decl + '\n' + r'\1', content, count=1)
-        print("OK: extern execveat placé avant do_execveat_common")
 
     old_code = '''	if (IS_ERR(filename))
 		return PTR_ERR(filename);'''
@@ -121,8 +117,6 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
         print("OK: execveat (appel inséré)")
-    else:
-        print("⚠️  execveat: pattern IS_ERR(filename) non trouvé")
 
 with open('fs/exec.c', 'w') as f:
     f.write(content)
@@ -130,7 +124,7 @@ PYEOF
   python3 /tmp/hook_execveat.py
 fi
 
-# --- setresuid (insertion après déclarations) ---
+# --- setresuid (marqueurs UNIQUES à setresuid) ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
   cat > /tmp/hook_setresuid.py << 'PYEOF'
 import re
@@ -149,23 +143,14 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
         content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
         print("OK: extern setresuid placé après les includes")
 
-    sig_pattern = r'(long __sys_setresuid\s*\([^)]*\)\s*\{)'
-    sig_match = re.search(sig_pattern, content)
-    if not sig_match:
-        print("❌ __sys_setresuid introuvable")
-        for line in content.split('\n'):
-            if 'setresuid' in line and '(' in line:
-                print("   >", line.strip()[:120])
-        exit(1)
-
     hook_code = '''#ifdef CONFIG_KSU
 	(void)ksu_handle_setresuid(ruid, euid, suid);
 #endif
 '''
     markers = [
-        '\tkruid = make_kuid(ns, ruid);',
-        '\tkuid_t kruid, keuid, ksuid;',
         '\tbool ruid_new, euid_new, suid_new;',
+        '\tkuid_t kruid, keuid, ksuid;',
+        '\tksuid = make_kuid(ns, suid);',
     ]
 
     inserted = False
@@ -177,10 +162,9 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
             break
 
     if not inserted:
-        print("❌ setresuid: marqueur d'insertion introuvable")
-        print("   Lignes contenant 'setresuid' ou 'kruid' :")
+        print("❌ setresuid: marqueur unique introuvable")
         for line in content.split('\n'):
-            if 'setresuid' in line or 'kruid' in line:
+            if 'ksuid' in line or 'ruid_new' in line:
                 print("   >", line.strip()[:120])
         exit(1)
 
@@ -218,8 +202,6 @@ extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *c
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
         print("OK: sys_read")
-    else:
-        print("⚠️  sys_read: pattern introuvable")
 
 with open('fs/read_write.c', 'w') as f:
     f.write(content)
@@ -267,8 +249,6 @@ extern __attribute__((cold)) int ksu_handle_input_handle_event(
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
         print("OK: input_event")
-    else:
-        print("⚠️  input_event: pattern introuvable")
 
 with open('drivers/input/input.c', 'w') as f:
     f.write(content)
