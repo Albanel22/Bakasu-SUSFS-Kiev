@@ -1,552 +1,528 @@
 #!/bin/bash
-################################################################################
-# Build ReSukiSU + SUSFS pour LineageOS 23.2 (SM8250 - Motorola One 5G Ace)
-# PRODUCTION-GRADE - Gestion d'erreurs stricte
-################################################################################
-
 set -euo pipefail
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# ============================================================
+# Méthode Ravindu - type ReSukiSU + SUSFS (Manual Hook)
+# Device: Motorola One 5G Ace (kiev / SM8250)
+# Kernel: 4.19.325
+# Target: LineageOS 23.2
+# ============================================================
 
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly BUILD_DIR="${BUILD_DIR:-.}"
-readonly OUTPUT_DIR="${BUILD_DIR}/output"
-readonly LOGS_DIR="${OUTPUT_DIR}/logs"
-readonly TEMP_DIR="${BUILD_DIR}/.tmp"
-readonly LOG_FILE="${LOGS_DIR}/build.log"
+echo "=== Build ReSukiSU + SUSFS (méthode Ravindu / manual hook) ==="
+echo "Appareil : Motorola One 5G Ace (kiev / SM8250)"
+echo "Kernel   : 4.19.325"
+echo "Build    : LineageOS 23.2"
 
-# Device & Kernel
-readonly DEVICE_NAME="kiev"
-readonly DEVICE_SOC="SM8250"
-readonly KERNEL_VERSION="4.19.325"
-readonly KERNEL_BRANCH="lineage-23.2"
-readonly KERNEL_REPO="https://github.com/LineageOS/android_kernel_motorola_sm8250.git"
-readonly KERNEL_CONFIG="vendor/lito-perf_defconfig"
-
-# Google Drive IDs
-readonly BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
-readonly DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
-
-# URLs
-readonly RESUKISU_SETUP_URL="https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh"
-readonly MAGISK_URL="https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk"
-
-# Compilation
-readonly PARALLEL_JOBS="${PARALLEL_JOBS:=$(nproc)}"
+# --- Config ---
 export ARCH=arm64
 export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
-# Timestamps
-readonly BUILD_START=$(date +%s)
+# Stock boot images
+BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
+DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
 
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
+# --- Pré-requis ---
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential bc bison ccache flex libelf-dev libssl-dev \
+    libncurses-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+    clang llvm lld llvm-tools device-tree-compiler git curl wget \
+    zip unzip python3 python3-pip mkbootimg
 
-die() {
-    echo "[ERROR] $*" >&2
+python3 -m pip install --quiet gdown
+
+# --- Répertoires ---
+cd "${GITHUB_WORKSPACE:-$PWD}"
+mkdir -p out output
+rm -rf kernel_sources ksud-src ksud final_boot.img boot-stock.img dtbo-stock.img repack || true
+
+# ============================================================
+# 1) CLONE KERNEL
+# ============================================================
+echo ""
+echo "=== 1. Clonage du kernel LineageOS (lineage-23.2) ==="
+git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
+cd kernel_sources
+git log --oneline -1
+
+# ============================================================
+# 2) INTÉGRATION RE SUKISU via setup.sh
+# ============================================================
+echo ""
+echo "=== 2. Intégration ReSukiSU via setup.sh ==="
+rm -rf drivers/kernelsu KernelSU susfs4ksu || true
+
+curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+
+if [ -d "drivers/kernelsu" ]; then
+    KSU_DIR="drivers/kernelsu"
+elif [ -d "KernelSU" ]; then
+    KSU_DIR="KernelSU"
+else
+    echo "ERROR: Impossible de trouver KernelSU après setup.sh"
     exit 1
-}
+fi
 
-setup_logging() {
-    mkdir -p "${LOGS_DIR}" || die "Impossible de créer ${LOGS_DIR}"
-    
-    {
-        echo "================================================================================"
-        echo "Build: LineageOS 23.2 + ReSukiSU + SUSFS"
-        echo "Device: ${DEVICE_NAME} (${DEVICE_SOC})"
-        echo "Kernel: ${KERNEL_VERSION}"
-        echo "Date: $(date)"
-        echo "================================================================================"
-    } > "${LOG_FILE}" || die "Impossible d'écrire dans ${LOG_FILE}"
-}
+echo "KSU_DIR détecté : $KSU_DIR"
 
-log_msg() {
-    local level="$1"
-    shift
-    local msg="$*"
-    local ts=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    if [ -w "${LOG_FILE}" ]; then
-        echo "[${ts}] [${level}] ${msg}" | tee -a "${LOG_FILE}"
-    else
-        echo "[${ts}] [${level}] ${msg}"
-    fi
-}
+# check KSU integration
+if ! grep -q 'CONFIG_KSU' drivers/Makefile 2>/dev/null; then
+    echo "ERROR: KSU non intégré dans drivers/Makefile"
+    exit 1
+fi
 
-log_info()    { log_msg "INFO" "$@"; }
-log_warn()    { log_msg "WARN" "$@"; }
-log_error()   { log_msg "ERROR" "$@"; }
-log_success() { log_msg "✓" "$@"; }
+if ! grep -q 'source.*Kconfig' drivers/Kconfig 2>/dev/null; then
+    echo "ERROR: KSU non intégré dans drivers/Kconfig"
+    exit 1
+fi
 
-print_section() {
-    echo ""
-    echo "╔════════════════════════════════════════════════════════════════╗"
-    echo "║ $*"
-    echo "╚════════════════════════════════════════════════════════════════╝"
-    log_info "=== $* ==="
-}
+# ============================================================
+# 3) HOOKS MANUELS RE SUKISU
+# ============================================================
+echo ""
+echo "=== 3. Hooks manuels ReSukiSU ==="
 
-elapsed_time() {
-    local end=$(date +%s)
-    local duration=$((end - BUILD_START))
-    printf "%02d:%02d:%02d" $((duration/3600)) $((duration%3600/60)) $((duration%60))
-}
-
-cleanup_on_error() {
-    local exit_code=$?
-    if [ $exit_code -ne 0 ]; then
-        log_error "Build échoué (code: $exit_code)"
-        log_error "Temps écoulé: $(elapsed_time)"
-        log_error "Log complet: ${LOG_FILE}"
-    fi
-    exit $exit_code
-}
-
-trap cleanup_on_error EXIT
-
-# =============================================================================
-# PRÉ-VÉRIFICATIONS
-# =============================================================================
-
-init_build() {
-    print_section "Initialisation"
-    
-    mkdir -p "${OUTPUT_DIR}" "${LOGS_DIR}" "${TEMP_DIR}" || \
-        die "Impossible de créer les répertoires"
-    
-    setup_logging
-    
-    log_info "BUILD_DIR: ${BUILD_DIR}"
-    log_info "OUTPUT_DIR: ${OUTPUT_DIR}"
-    log_info "PARALLEL_JOBS: ${PARALLEL_JOBS}"
-    
-    return 0
-}
-
-check_space() {
-    local available=$(df "${BUILD_DIR}" 2>/dev/null | tail -1 | awk '{print $4}')
-    
-    if [ -z "$available" ] || [ "$available" -lt 20971520 ]; then
-        log_warn "Espace disque < 20GB disponible"
-    else
-        log_info "Espace disque: $(numfmt --to=iec-i --suffix=B $((available * 1024)) 2>/dev/null || echo "${available}KB")"
-    fi
-}
-
-verify_tools() {
-    print_section "Vérification des outils requis"
-    
-    # TOOLS_TO_CHECK: maps "command" to "package_name"
-    local -A tools_map=(
-        ["git"]="git"
-        ["curl"]="curl"
-        ["wget"]="wget"
-        ["python3"]="python3"
-        ["make"]="make"
-        ["unzip"]="unzip"
-        ["zip"]="zip"
-        ["clang"]="clang"
-        ["lld"]="lld"
-        ["aarch64-linux-gnu-gcc"]="gcc-aarch64-linux-gnu"
-        ["arm-linux-gnueabi-gcc"]="gcc-arm-linux-gnueabi"
-    )
-    
-    local missing=()
-    
-    for cmd in "${!tools_map[@]}"; do
-        if command -v "$cmd" &>/dev/null; then
-            log_success "$cmd"
-        else
-            missing+=("${tools_map[$cmd]}")
-            log_warn "✗ $cmd (${tools_map[$cmd]})"
-        fi
-    done
-    
-    if [ ${#missing[@]} -gt 0 ]; then
-        log_error "Outils manquants: ${missing[*]}"
-        return 1
-    fi
-    
-    return 0
-}
-
-install_deps() {
-    print_section "Installation des dépendances"
-    
-    if [ -z "${CI:-}" ] && [ -z "${GITHUB_WORKSPACE:-}" ]; then
-        log_warn "Pas en CI, installation manuelle requise"
-        log_warn "Exécutez: sudo apt-get install build-essential clang lld llvm device-tree-compiler"
-        return 0
-    fi
-    
-    log_info "Nettoyage APT..."
-    sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
-    sudo apt-get clean -qq 2>/dev/null || true
-    sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list 2>/dev/null || true
-    
-    log_info "Mise à jour APT..."
-    sudo apt-get update -qq 2>&1 | grep -E "Hit|Get" | head -20 || true
-    
-    log_info "Installation groupe 1: Build essentials..."
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        bc bison build-essential ccache flex \
-        glibc-source libelf-dev libssl-dev libncurses-dev || die "Groupe 1 échoué"
-    
-    log_info "Installation groupe 2: Cross-compilers..."
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi || die "Groupe 2 échoué"
-    
-    log_info "Installation groupe 3: LLVM/Clang..."
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        clang llvm lld llvm-tools device-tree-compiler || die "Groupe 3 échoué"
-    
-    log_info "Installation groupe 4: Outils..."
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        zip unzip curl git python3 python3-pip mkbootimg || die "Groupe 4 échoué"
-    
-    log_info "Installation de gdown..."
-    pip3 install --quiet --user gdown 2>/dev/null || \
-        log_warn "gdown optionnel (non critique)"
-    
-    log_success "Dépendances installées"
-    
-    # Vérifier post-install
-    log_info "Vérification post-installation..."
-    if ! verify_tools; then
-        die "Certains outils manquent toujours après installation"
-    fi
-    
-    return 0
-}
-
-# =============================================================================
-# KERNEL BUILD
-# =============================================================================
-
-clone_kernel() {
-    print_section "Clone du kernel"
-    
-    local kernel_dir="${BUILD_DIR}/kernel_sources"
-    
-    if [ -d "${kernel_dir}/.git" ]; then
-        log_warn "Kernel déjà cloné"
-        cd "${kernel_dir}"
-    else
-        log_info "Clone depuis: ${KERNEL_REPO}"
-        git clone \
-            --depth=1 \
-            -b "${KERNEL_BRANCH}" \
-            "${KERNEL_REPO}" \
-            "${kernel_dir}" 2>&1 | tee -a "${LOG_FILE}" || \
-            die "Clone échoué"
-        cd "${kernel_dir}"
-    fi
-    
-    local commit=$(git log --oneline -1)
-    log_success "Kernel: $commit"
-}
-
-integrate_resukisu() {
-    print_section "Intégration ReSukiSU"
-    
-    cd "${BUILD_DIR}/kernel_sources"
-    
-    rm -rf drivers/kernelsu KernelSU susfs4ksu 2>/dev/null || true
-    
-    log_info "Exécution setup.sh..."
-    curl -fsSL "${RESUKISU_SETUP_URL}" | bash 2>&1 | tee -a "${LOG_FILE}" || \
-        die "ReSukiSU setup échoué"
-    
-    # Vérifier Kconfig
-    if ! grep -q 'source.*[Kk]ernelsu.*Kconfig' drivers/Kconfig 2>/dev/null; then
-        die "Kconfig ReSukiSU non intégré"
-    fi
-    
-    # Vérifier Makefile
-    if ! grep -q 'CONFIG_KSU' drivers/Makefile 2>/dev/null; then
-        die "Makefile ReSukiSU non intégré"
-    fi
-    
-    log_success "ReSukiSU intégré"
-}
-
-apply_hooks() {
-    print_section "Application des hooks manuels"
-    
-    cd "${BUILD_DIR}/kernel_sources"
-    
-    # Hook: execveat
-    if ! grep -q "ksu_handle_execveat" fs/exec.c 2>/dev/null; then
-        log_info "Hook execveat..."
-        python3 << 'EOF_HOOK1'
-import re, sys
-with open('fs/exec.c', 'r') as f:
-    content = f.read()
-if 'ksu_execveat_hook' in content:
-    sys.exit(0)
-extern = '#ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n                void *argv, void *envp, int *flags);\nextern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n                 void *argv, void *envp, int *flags);\n#endif\n'
-m = re.search(r'(#include.*?\n)+', content)
-if m:
-    content = content[:m.end()] + extern + content[m.end():]
-old = '\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);'
-new = old + '\n\n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_execveat_hook))\n\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n\telse\n\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif'
-content = content.replace(old, new, 1)
-with open('fs/exec.c', 'w') as f:
-    f.write(content)
-print('OK')
-EOF_HOOK1
-        [ $? -ne 0 ] && die "Hook execveat échoué"
-    fi
-    
-    # Hook: setresuid
-    if ! grep -q "ksu_handle_setresuid" kernel/sys.c 2>/dev/null; then
-        log_info "Hook setresuid..."
-        python3 << 'EOF_HOOK2'
-import re, sys
-with open('kernel/sys.c', 'r') as f:
-    content = f.read()
-if 'ksu_handle_setresuid' in content:
-    sys.exit(0)
-extern = '#ifdef CONFIG_KSU\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n'
-m = re.search(r'(#include.*?\n)+', content)
-if m:
-    content = content[:m.end()] + extern + content[m.end():]
-hook = '#ifdef CONFIG_KSU\n\t(void)ksu_handle_setresuid(ruid, euid, suid);\n#endif\n'
-for marker in ['\tbool ruid_new, euid_new, suid_new;', '\tkuid_t kruid, keuid, ksuid;']:
-    if marker in content:
-        content = content.replace(marker, marker + '\n' + hook, 1)
-        break
-with open('kernel/sys.c', 'w') as f:
-    f.write(content)
-print('OK')
-EOF_HOOK2
-        [ $? -ne 0 ] && die "Hook setresuid échoué"
-    fi
-    
-    # Hook: sys_read
-    if ! grep -q "ksu_handle_sys_read" fs/read_write.c 2>/dev/null; then
-        log_info "Hook sys_read..."
-        python3 << 'EOF_HOOK3'
-import sys
-with open('fs/read_write.c', 'r') as f:
-    content = f.read()
-if 'ksu_handle_sys_read' in content:
-    sys.exit(0)
-extern = '#ifdef CONFIG_KSU\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n'
+# --- execveat ---
+if ! grep -q "ksu_handle_execveat" fs/exec.c 2>/dev/null; then
+  python3 <<'PY'
 import re
-m = re.search(r'(#include.*?\n)+', content)
-if m:
-    content = content[:m.end()] + extern + content[m.end():]
-old = 'SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n{'
-new = old + '\n#ifdef CONFIG_KSU\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif'
-content = content.replace(old, new, 1)
-with open('fs/read_write.c', 'w') as f:
-    f.write(content)
-print('OK')
-EOF_HOOK3
-        [ $? -ne 0 ] && die "Hook sys_read échoué"
-    fi
-    
-    # Hook: input_event
-    if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c 2>/dev/null; then
-        log_info "Hook input_event..."
-        python3 << 'EOF_HOOK4'
-import re, sys
-with open('drivers/input/input.c', 'r') as f:
+path = "fs/exec.c"
+with open(path, "r") as f:
     content = f.read()
-if 'ksu_handle_input_handle_event' in content:
-    sys.exit(0)
-extern = '#ifdef CONFIG_KSU\nextern bool ksu_input_hook __read_mostly;\nextern __attribute__((cold)) int ksu_handle_input_handle_event(\n\t\t\tunsigned int *type, unsigned int *code, int *value);\n#endif\n'
-m = re.search(r'(#include.*?\n)+', content)
-if m:
-    content = content[:m.end()] + extern + content[m.end():]
-old = 'if (is_event_supported(type, dev->evbit, EV_MAX)) {'
-new = '#ifdef CONFIG_KSU\n\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n\n\tif (is_event_supported(type, dev->evbit, EV_MAX)) {'
-content = content.replace(old, new, 1)
-with open('drivers/input/input.c', 'w') as f:
+
+if "ksu_execveat_hook" not in content:
+    extern_decl = '''
+#ifdef CONFIG_KSU
+extern bool ksu_execveat_hook __read_mostly;
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+				void *argv, void *envp, int *flags);
+extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+				 void *argv, void *envp, int *flags);
+#endif
+'''
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m:
+        content = content[:m.end()] + extern_decl + "\n" + content[m.end():]
+
+    old = '''	if (IS_ERR(filename))
+		return PTR_ERR(filename);'''
+    new = '''	if (IS_ERR(filename))
+		return PTR_ERR(filename);
+
+#ifdef CONFIG_KSU
+	if (unlikely(ksu_execveat_hook))
+		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+	else
+		ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+#endif'''
+    if old in content:
+        content = content.replace(old, new, 1)
+
+with open(path, "w") as f:
     f.write(content)
-print('OK')
-EOF_HOOK4
-        [ $? -ne 0 ] && die "Hook input_event échoué"
-    fi
-    
-    log_success "Tous les hooks appliqués"
-}
+PY
+fi
 
-verify_hooks() {
-    print_section "Vérification des hooks"
-    
-    cd "${BUILD_DIR}/kernel_sources"
-    
-    local checks=(
-        "ksu_handle_execveat:fs/exec.c"
-        "ksu_handle_setresuid:kernel/sys.c"
-        "ksu_handle_sys_read:fs/read_write.c"
-        "ksu_handle_input_handle_event:drivers/input/input.c"
-    )
-    
-    for check in "${checks[@]}"; do
-        local fn="${check%%:*}"
-        local file="${check##*:}"
-        
-        if grep -q "$fn" "$file" 2>/dev/null; then
-            log_success "✓ $fn"
-        else
-            die "Hook manquant: $fn dans $file"
-        fi
-    done
-}
+# --- setresuid ---
+if ! grep -q "ksu_handle_setresuid" kernel/sys.c 2>/dev/null; then
+  python3 <<'PY'
+import re
+path = "kernel/sys.c"
+with open(path, "r") as f:
+    content = f.read()
 
-configure_kernel() {
-    print_section "Configuration du kernel"
-    
-    cd "${BUILD_DIR}/kernel_sources"
-    
-    if [ ! -f "arch/arm64/configs/${KERNEL_CONFIG}" ]; then
-        die "Config ${KERNEL_CONFIG} introuvable"
-    fi
-    
-    mkdir -p out
-    
-    log_info "Chargement config..."
-    make O=out LLVM=1 \
-        CROSS_COMPILE="${CROSS_COMPILE}" \
-        CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
-        "${KERNEL_CONFIG}" 2>&1 | tee -a "${LOG_FILE}" || \
-        die "make defconfig échoué"
-    
-    log_info "Ajout options KSU/SUSFS..."
-    cat >> out/.config << 'EOF'
-CONFIG_KSU=y
-CONFIG_KSU_MANUAL_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
-# CONFIG_KPROBES is not set
-CONFIG_COMPAT=y
-CONFIG_COMPAT_32BIT_TIME=y
-CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SUS_MAP=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-EOF
-    
-    make O=out LLVM=1 \
-        CROSS_COMPILE="${CROSS_COMPILE}" \
-        CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
-        olddefconfig 2>&1 | tee -a "${LOG_FILE}" || \
-        die "olddefconfig échoué"
-    
-    # Forcer les options
-    sed -i 's/# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config || true
-    sed -i 's/^CONFIG_KPROBES=y/# CONFIG_KPROBES is not set/' out/.config || true
-    
-    log_success "Configuration complète"
-}
+if "ksu_handle_setresuid" not in content:
+    extern_decl = '''
+#ifdef CONFIG_KSU
+extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+#endif
+'''
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m:
+        content = content[:m.end()] + extern_decl + "\n" + content[m.end():]
 
-compile_kernel() {
-    print_section "Compilation du kernel"
-    
-    cd "${BUILD_DIR}/kernel_sources"
-    
-    log_info "Compilation (${PARALLEL_JOBS} jobs)..."
-    
-    if ! make O=out LLVM=1 \
-        CROSS_COMPILE="${CROSS_COMPILE}" \
-        CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
-        -j"${PARALLEL_JOBS}" \
-        Image 2>&1 | tee -a "${LOG_FILE}"; then
-        
-        log_error "Compilation échouée"
-        die "Kernel compilation failed"
-    fi
-    
-    if [ ! -f "out/arch/arm64/boot/Image" ]; then
-        die "Image kernel non générée"
-    fi
-    
-    local size=$(du -h out/arch/arm64/boot/Image | cut -f1)
-    log_success "Kernel compilé: ${size}"
-}
+    hook = '''#ifdef CONFIG_KSU
+	(void)ksu_handle_setresuid(ruid, euid, suid);
+#endif
+'''
+    markers = [
+        '\tbool ruid_new, euid_new, suid_new;',
+        '\tkuid_t kruid, keuid, ksuid;',
+        '\tksuid = make_kuid(ns, suid);',
+    ]
+    inserted = False
+    for marker in markers:
+        if marker in content:
+            content = content.replace(marker, marker + '\n' + hook, 1)
+            inserted = True
+            break
+    if not inserted:
+        raise RuntimeError("setresuid marker not found")
 
-# =============================================================================
-# OUTPUT
-# =============================================================================
+with open(path, "w") as f:
+    f.write(content)
+PY
+fi
 
-collect_artifacts() {
-    print_section "Collecte des artefacts"
-    
-    mkdir -p "${OUTPUT_DIR}"
-    
-    if [ -f "${BUILD_DIR}/kernel_sources/out/arch/arm64/boot/Image" ]; then
-        cp "${BUILD_DIR}/kernel_sources/out/arch/arm64/boot/Image" \
-            "${OUTPUT_DIR}/kernel-Image" || die "Copie kernel échouée"
-        log_success "✓ kernel-Image ($(du -h "${OUTPUT_DIR}/kernel-Image" | cut -f1))"
-    fi
-    
-    if [ -f "${LOG_FILE}" ]; then
-        log_success "✓ build.log"
-    fi
-    
-    log_info ""
-    log_info "Fichiers générés:"
-    ls -lh "${OUTPUT_DIR}/"
-}
+# --- sys_read ---
+if ! grep -q "ksu_handle_sys_read" fs/read_write.c 2>/dev/null; then
+  python3 <<'PY'
+import re
+path = "fs/read_write.c"
+with open(path, "r") as f:
+    content = f.read()
 
-print_summary() {
-    local duration=$(elapsed_time)
-    
-    print_section "BUILD RÉUSSI!"
-    
-    log_success "Temps total: ${duration}"
-    log_info "Device: ${DEVICE_NAME} (${DEVICE_SOC})"
-    log_info "Kernel: ${KERNEL_VERSION}"
-    log_info "Output: ${OUTPUT_DIR}"
-    log_info "Log: ${LOG_FILE}"
-    
-    echo ""
-}
+if "ksu_handle_sys_read" not in content:
+    extern_decl = '''
+#ifdef CONFIG_KSU
+extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
+#endif
+'''
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m:
+        content = content[:m.end()] + extern_decl + "\n" + content[m.end():]
 
-# =============================================================================
-# MAIN
-# =============================================================================
+    old = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+{'''
+    new = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+{
+#ifdef CONFIG_KSU
+	ksu_handle_sys_read(fd, &buf, &count);
+#endif'''
+    if old in content:
+        content = content.replace(old, new, 1)
 
-main() {
-    init_build
-    check_space
-    
-    if ! verify_tools; then
-        log_warn "Outils manquants, installation..."
-        install_deps || die "Installation dépendances échouée"
+with open(path, "w") as f:
+    f.write(content)
+PY
+fi
+
+# --- input_event ---
+if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c 2>/dev/null; then
+  python3 <<'PY'
+import re
+path = "drivers/input/input.c"
+with open(path, "r") as f:
+    content = f.read()
+
+if "ksu_handle_input_handle_event" not in content:
+    extern_decl = '''
+#ifdef CONFIG_KSU
+extern bool ksu_input_hook __read_mostly;
+extern __attribute__((cold)) int ksu_handle_input_handle_event(
+			unsigned int *type, unsigned int *code, int *value);
+#endif
+'''
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m:
+        content = content[:m.end()] + extern_decl + "\n" + content[m.end():]
+
+    old = '''void input_event(struct input_dev *dev,
+		 unsigned int type, unsigned int code, int value)
+{
+	unsigned long flags;
+
+	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
+    new = '''void input_event(struct input_dev *dev,
+		 unsigned int type, unsigned int code, int value)
+{
+	unsigned long flags;
+
+#ifdef CONFIG_KSU
+	if (unlikely(ksu_input_hook))
+		ksu_handle_input_handle_event(&type, &code, &value);
+#endif
+
+	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
+    if old in content:
+        content = content.replace(old, new, 1)
+
+with open(path, "w") as f:
+    f.write(content)
+PY
+fi
+
+# verification finale
+for hook in \
+  "ksu_handle_execveat:fs/exec.c" \
+  "ksu_handle_setresuid:kernel/sys.c" \
+  "ksu_handle_sys_read:fs/read_write.c" \
+  "ksu_handle_input_handle_event:drivers/input/input.c"; do
+    fn="${hook%%:*}"
+    file="${hook##*:}"
+    if grep -q "$fn" "$file" 2>/dev/null; then
+        echo "  ✓ $fn présent dans $file"
     else
-        log_success "Tous les outils présents"
+        echo "  ERROR : $fn absent dans $file"
+        exit 1
     fi
-    
-    clone_kernel
-    integrate_resukisu
-    apply_hooks
-    verify_hooks
-    configure_kernel
-    compile_kernel
-    
-    collect_artifacts
-    print_summary
-}
+done
 
-main "$@"
+# ============================================================
+# 4) PATCH SECURE COMPAT / SECCOMP
+# ============================================================
+echo ""
+echo "=== 4. Patches de compatibilité / seccomp ==="
+
+# app_profile.c
+python3 <<'PY'
+import os, re
+from pathlib import Path
+
+candidates = ["drivers/kernelsu/policy/app_profile.c", "KernelSU/kernel/policy/app_profile.c"]
+path = None
+for c in candidates:
+    if os.path.exists(c):
+        path = Path(c)
+        break
+
+if path is not None:
+    content = path.read_text()
+    if "CONFIG_KSU_SECCOMP_SAFE" not in content:
+        pattern = r'(void\s+disable_seccomp\s*\(void\)\s*\{)'
+        m = re.search(pattern, content)
+        if m:
+            brace_start = m.end()-1
+            depth = 1
+            i = brace_start + 1
+            end = -1
+            while i < len(content) and depth > 0:
+                if content[i] == '{':
+                    depth += 1
+                elif content[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+                i += 1
+            if end >= 0:
+                body = content[brace_start+1:end]
+                new_body = '\n#ifdef CONFIG_SECCOMP\n' + body + '\n#else\n\t/* CONFIG_KSU_SECCOMP_SAFE : seccomp désactivé, rien à faire */\n\treturn;\n#endif\n'
+                content = content[:brace_start+1] + new_body + content[end:]
+                path.write_text(content)
+                print("app_profile patched")
+PY
+
+# kernel/seccomp.c
+python3 <<'PY'
+from pathlib import Path
+import re
+
+path = Path("kernel/seccomp.c")
+if path.exists():
+    content = path.read_text()
+    if "CONFIG_KSU_SECCOMP_BYPASS" not in content:
+        pattern = r'(int\s+__secure_computing\s*\([^)]+\)\s*\{[^}]*?int\s+this_syscall\s*;)'
+        m = re.search(pattern, content, re.DOTALL)
+        if m:
+            pos = m.end()
+            bypass = '''
+#ifdef CONFIG_KSU
+	/* bypass syscalls KernelSU/SUSFS */
+	{
+		int __ksu_nr = sd ? sd->nr : syscall_get_nr(current, task_pt_regs(current));
+		if (__ksu_nr == __NR_reboot && sd) {
+			if ((unsigned long)sd->args[0] == 0xDEADBEEFUL) {
+				return 0;
+			}
+		}
+	}
+#endif
+'''
+            content = content[:pos] + bypass + content[pos:]
+            path.write_text(content)
+            print("seccomp bypass inserted")
+PY
+
+# ============================================================
+# 5) CONFIGURATION KERNEL
+# ============================================================
+echo ""
+echo "=== 5. Configuration du noyau ==="
+
+mkdir -p out
+make O=out LLVM=1 CROSS_COMPILE="${CROSS_COMPILE}" CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" vendor/lito-perf_defconfig
+
+{
+  echo "CONFIG_KSU=y"
+  echo "CONFIG_KSU_MANUAL_HOOK=y"
+  echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
+  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y"
+  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y"
+  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"
+  echo "# CONFIG_KPROBES is not set"
+  echo "CONFIG_COMPAT=y"
+  echo "CONFIG_COMPAT_32BIT_TIME=y"
+  echo "CONFIG_KSU_SUSFS=y"
+  echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+  echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+  echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+  echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+  echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+  echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+  echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+  echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+  echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+  echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+} >> out/.config
+
+make O=out LLVM=1 CROSS_COMPILE="${CROSS_COMPILE}" CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" olddefconfig
+
+if grep -q "# CONFIG_KSU_MANUAL_HOOK is not set" out/.config; then
+    sed -i 's/# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
+fi
+if ! grep -q "CONFIG_KSU_MANUAL_HOOK" out/.config; then
+    echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
+fi
+
+if grep -q "^CONFIG_KPROBES=y" out/.config; then
+    sed -i 's/^CONFIG_KPROBES=y/# CONFIG_KPROBES is not set/' out/.config
+fi
+
+echo "=== Options finales KSU / KPROBES ==="
+grep -E "KSU_MANUAL_HOOK|KPROBES" out/.config || true
+
+# ============================================================
+# 6) COMPILATION
+# ============================================================
+echo ""
+echo "=== 6. Compilation du noyau ==="
+
+make O=out LLVM=1 CROSS_COMPILE="${CROSS_COMPILE}" CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" -j"$(nproc)" Image 2>&1 | tee build.log
+
+if [ ! -f "out/arch/arm64/boot/Image" ]; then
+    echo "ERROR: Build kernel failed"
+    grep -iE "error:|fatal error:" build.log | head -30 || true
+    exit 1
+fi
+
+echo "✅ Kernel compilé"
+ls -lh out/arch/arm64/boot/
+
+# ============================================================
+# 7) COMPILATION KSUD
+# ============================================================
+echo ""
+echo "=== 7. Compilation ksud (ReSukiSU) ==="
+cd "${GITHUB_WORKSPACE:-$PWD}"
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+rustup toolchain install nightly
+rustup default nightly
+rustup target add aarch64-linux-android
+
+wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip -O android-ndk-r26d-linux.zip
+unzip -q android-ndk-r26d-linux.zip
+
+export ANDROID_NDK_ROOT="${GITHUB_WORKSPACE:-$PWD}/android-ndk-r26d"
+export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+export AARCH64_CLANG_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+export AARCH64_CLANGXX_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++"
+export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
+
+rm -rf ksud-src
+git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git ksud-src
+
+cd ksud-src/userspace/ksud
+mkdir -p .cargo
+
+cat > .cargo/config.toml <<EOF
+[target.aarch64-linux-android]
+linker = "$AARCH64_CLANG_PATH"
+
+[env]
+CC_aarch64_linux_android = "$AARCH64_CLANG_PATH"
+CXX_aarch64_linux_android = "$AARCH64_CLANGXX_PATH"
+AR_aarch64_linux_android = "$AR_PATH"
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"
+EOF
+
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+cargo +nightly build --release --target aarch64-linux-android
+
+KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1)
+if [ -z "$KSUD_BINARY" ]; then
+    echo "ERROR: ksud non trouvé"
+    exit 1
+fi
+
+cp "$KSUD_BINARY" "${GITHUB_WORKSPACE:-$PWD}/ksud"
+chmod 755 "${GITHUB_WORKSPACE:-$PWD}/ksud"
+
+echo "✅ ksud compilé"
+ls -lh "${GITHUB_WORKSPACE:-$PWD}/ksud"
+
+# ============================================================
+# 8) STOCK BOOT + REPACK
+# ============================================================
+echo ""
+echo "=== 8. Téléchargement des images stock et repack ==="
+
+cd "${GITHUB_WORKSPACE:-$PWD}"
+
+gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img
+gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img || true
+
+mkdir -p repack
+cp boot-stock.img repack/boot.img
+
+wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O Magisk-v27.0.apk
+unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so
+mv lib/x86_64/libmagiskboot.so repack/magiskboot
+chmod +x repack/magiskboot
+rm -rf Magisk-v27.0.apk lib/
+
+cd repack
+./magiskboot unpack boot.img
+
+if [ ! -f kernel ] || [ ! -f ramdisk.cpio ]; then
+    echo "ERROR: unpack boot.img failed"
+    exit 1
+fi
+
+cp "${GITHUB_WORKSPACE:-$PWD}/kernel_sources/out/arch/arm64/boot/Image" kernel
+
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 data" \
+    "mkdir 0755 data/adb" \
+    "mkdir 0755 data/adb/ksud" \
+    "add 0755 data/adb/ksud/ksud ${GITHUB_WORKSPACE:-$PWD}/ksud"
+
+cp "${GITHUB_WORKSPACE:-$PWD}/ksud" local_su_binary
+chmod 755 local_su_binary
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 system" \
+    "mkdir 0755 system/bin" \
+    "add 06755 system/bin/su ./local_su_binary"
+rm -f local_su_binary
+
+./magiskboot repack boot.img new-boot.img
+mv new-boot.img ../final_boot.img
+cd ..
+
+# ============================================================
+# 9) SORTIE
+# ============================================================
+echo ""
+echo "=== 9. Sortie des artefacts ==="
+
+mkdir -p output
+cp final_boot.img output/ReSukiSU-SuSFS-boot.img
+cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
+cp kernel_sources/build.log output/ || true
+cp ksud output/ksud || true
+
+ls -lh output/
+
+echo "=== BUILD TERMINÉ ==="
+echo "Noyau + ksud: ReSukiSU + SUSFS"
+echo "Boot final: output/ReSukiSU-SuSFS-boot.img"
