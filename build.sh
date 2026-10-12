@@ -86,8 +86,8 @@ for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
 done
 echo "  ✅ __maybe_unused appliqué"
 
-# Export KCFLAGS — méthode propre, ne touche PAS au Makefile
-export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=maybe-uninitialized -Wno-error=unused-but-set-variable"
+# Export KCFLAGS — uniquement des warnings qui existent en clang
+export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=unused-but-set-variable"
 echo "  ✅ KCFLAGS exporté : $KCFLAGS"
 echo "✅ Corrections terminées"
 
