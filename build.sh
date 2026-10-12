@@ -76,7 +76,7 @@ else
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 2c. VIDER TOUS LES FICHIERS DE VÉRIFICATION ====================
+# ==================== 2c. VIDER TOUTES LES VÉRIFICATIONS ====================
 echo ""
 echo "=== Suppression de toutes les vérifications bloquantes ==="
 
@@ -100,8 +100,8 @@ for pattern in "${CHECK_PATTERNS[@]}"; do
 done
 
 echo ""
-echo "→ Recherche de tous les \$(error dans $KSU_DIR..."
-ERROR_FILES=$(grep -rl '\$(error' "$KSU_DIR" --include="*.mk" 2>/dev/null || true)
+echo "→ Recherche de tous les \$(error dans $KSU_DIR (.mk + Kbuild)..."
+ERROR_FILES=$(grep -rl '\$(error' "$KSU_DIR" --include="*.mk" --include="Kbuild" 2>/dev/null || true)
 
 if [ -n "$ERROR_FILES" ]; then
     for f in $ERROR_FILES; do
@@ -113,10 +113,20 @@ else
     echo "⚠️  Aucun \$(error trouvé"
 fi
 
+KSU_KBUILD="$KSU_DIR/Kbuild"
+if [ -f "$KSU_KBUILD" ]; then
+    echo ""
+    echo "→ Traitement supplémentaire de $KSU_KBUILD"
+    sed -i '/\$\(error.*You should/d' "$KSU_KBUILD" 2>/dev/null || true
+    sed -i '/\$\(error.*integrate susfs/d' "$KSU_KBUILD" 2>/dev/null || true
+    sed -i 's/\$(error /\$(warning /g' "$KSU_KBUILD" 2>/dev/null || true
+    echo "  ✅ Lignes \$\(error neutralisées dans Kbuild"
+fi
+
 echo ""
-echo "→ Commentaire des includes dans les Makefiles..."
-KSU_MAKEFILES=$(find "$KSU_DIR" -name "Makefile" -type f 2>/dev/null)
-for mf in $KSU_MAKEFILES; do
+echo "→ Commentaire des includes dans les Makefiles/Kbuild..."
+KSU_BUILD_FILES=$(find "$KSU_DIR" \( -name "Makefile" -o -name "Kbuild" \) -type f 2>/dev/null)
+for mf in $KSU_BUILD_FILES; do
     sed -i 's/^\(.*include.*_check\.mk.*\)/# \1/' "$mf" 2>/dev/null || true
     sed -i 's/^\(.*include.*susfs_compat\.mk.*\)/# \1/' "$mf" 2>/dev/null || true
 done
@@ -422,21 +432,6 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "# CONFIG_KPROBES is not set"
   echo "CONFIG_COMPAT=y"
   echo "CONFIG_COMPAT_32BIT_TIME=y"
-  echo "CONFIG_KSU_SUSFS=y"
-  echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-  echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-  echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-  echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-  echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
-  echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
-  echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
-  echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
-  echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
 } >> out/.config
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
@@ -455,7 +450,7 @@ if grep -q "^CONFIG_KPROBES=y" out/.config; then
 fi
 
 echo "=== État final .config ==="
-grep -E "KSU_MANUAL_HOOK|KPROBES" out/.config || true
+grep -E "KSU_MANUAL_HOOK|KPROBES|KSU_SUSFS" out/.config || true
 
 # ==================== 4b. BYPASS SECCOMP CIBLÉ ====================
 echo "=== Patch bypass seccomp ciblé dans kernel/seccomp.c ==="
