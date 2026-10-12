@@ -1,7 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "=== Build ReSukiSU/BakaSU + SUSFS pour kiev (SM8250) ==="
+# =============================================================================
+# BUILD : LineageOS 23.2 + BakaSU + SUSFS (kernel 4.19 non-GKI)
+# Appareil : Motorola One 5G Ace (kiev / SM8250)
+# =============================================================================
+
+echo "=== Build BakaSU + SUSFS pour kiev (SM8250) ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -41,7 +46,7 @@ fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
 # ==================== 3. INTÉGRATION SUSFS (cyberc3dr pour kernel 4.19) ====================
-echo "=== Intégration SUSFS 2.3.0 depuis cyberc3dr ==="
+echo "=== Intégration SUSFS depuis cyberc3dr ==="
 cd "$GITHUB_WORKSPACE"
 rm -rf /tmp/cyber_repo
 git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Build.git /tmp/cyber_repo
@@ -52,15 +57,10 @@ SUSFS_PATCH="/tmp/cyber_repo/Patches/Patch/susfs_patch_to_4.19.patch"
 if [ -f "$SUSFS_PATCH" ]; then
     echo "→ Application du patch SUSFS 4.19..."
     patch -p1 --forward --batch < "$SUSFS_PATCH" 2>&1 | tee /tmp/susfs_patch.log || true
-
-    # Nettoyage des rejets
     find . -name "*.rej" -type f -delete 2>/dev/null || true
     echo "  ✅ Patch SUSFS appliqué"
-else
-    echo "  ⚠️  Patch SUSFS non trouvé, on continue sans SUSFS"
 fi
 
-# Copier les fichiers SUSFS additionnels
 if [ -d "/tmp/cyber_repo/Patches/fs" ]; then
     cp -rn /tmp/cyber_repo/Patches/fs/* fs/ 2>/dev/null || true
 fi
@@ -68,12 +68,27 @@ if [ -d "/tmp/cyber_repo/Patches/include/linux" ]; then
     cp -rn /tmp/cyber_repo/Patches/include/linux/* include/linux/ 2>/dev/null || true
 fi
 
-# Ajouter susfs.o au Makefile
 if [ -f "fs/Makefile" ] && ! grep -q "susfs.o" fs/Makefile; then
     echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
     [ -f "fs/sus_su.c" ] && ! grep -q "sus_su.o" fs/Makefile && echo "obj-\$(CONFIG_KSU_SUSFS) += sus_su.o" >> fs/Makefile
 fi
 echo "✅ SUSFS intégré"
+
+# ==================== 3b. FIX unused variable dans task_mmu.c ====================
+echo ""
+echo "=== Correction des variables inutilisées dans task_mmu.c ==="
+
+if [ -f "fs/proc/task_mmu.c" ]; then
+    sed -i 's/^\s*struct vm_area_struct \*vma;/struct vm_area_struct *vma __maybe_unused;/g' fs/proc/task_mmu.c
+    echo "  ✅ 'vma' marquée __maybe_unused dans task_mmu.c"
+fi
+
+for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
+    if [ -f "$f" ]; then
+        sed -i 's/^\s*struct vm_area_struct \*vma;/struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
+    fi
+done
+echo "✅ Vérification terminée"
 
 # ==================== 4. NEUTRALISATION DES VÉRIFICATIONS ====================
 echo ""
@@ -98,11 +113,11 @@ if [ -n "$ERROR_MK_FILES" ]; then
 fi
 echo "✅ Neutralisation terminée"
 
-# ==================== 5. HOOKS MANUELS BakaSU (style manuel) ====================
+# ==================== 5. HOOKS MANUELS BakaSU ====================
 echo ""
 echo "=== Hooks manuels BakaSU ==="
 
-# --- execveat (hook manuel pour non-GKI, sans ksu_execveat_hook) ---
+# --- execveat (sans ksu_execveat_hook, mode manuel pur) ---
 if ! grep -q "ksu_handle_execveat" fs/exec.c; then
   cat > /tmp/hook_execveat.py << 'PYEOF'
 import re
