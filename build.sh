@@ -89,14 +89,12 @@ export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error
 echo "  ✅ KCFLAGS exporté : $KCFLAGS"
 echo "✅ Corrections terminées"
 
-# ==================== 3c. INJECTION DES DÉCLARATIONS SUSFS MANQUANTES ====================
+# ==================== 3c. INJECTION FORCÉE DES DÉCLARATIONS SUSFS ====================
 echo ""
 echo "=== Injection des déclarations SUSFS manquantes ==="
 
 python3 << 'PYEOF_SUSFS_DECL'
-import re
 from pathlib import Path
-import os
 
 decl = '''
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
@@ -106,52 +104,80 @@ extern bool susfs_is_current_ksu_domain(void);
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
 
 #ifndef DEFAULT_KSU_MNT_MINOR_DEV
-#define DEFAULT_KSU_MNT_MINOR_DEV (1 << 20)
+#define DEFAULT_KSU_MNT_MINOR_DEV (1 << 12)
+#endif
+#ifndef DEFAULT_KSU_MNT_GROUP_ID
+#define DEFAULT_KSU_MNT_GROUP_ID 200000
 #endif
 #endif /* CONFIG_KSU_SUSFS_SUS_MOUNT */
 '''
 
-# --- fs/super.c ---
-if os.path.exists("fs/super.c"):
-    content = Path("fs/super.c").read_text()
-    if 'susfs_is_current_ksu_domain' not in content:
-        # Insérer après le premier bloc d'includes
-        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-        if m:
-            content = content[:m.end()] + decl + '\n' + content[m.end():]
-            Path("fs/super.c").write_text(content)
-            print("[+] fs/super.c : déclarations SUSFS injectées")
-        else:
-            print("[!] fs/super.c : pas d'includes trouvés")
+def inject_decl(filepath):
+    p = Path(filepath)
+    if not p.exists():
+        print(f"[i] {filepath} : introuvable")
+        return
+    
+    content = p.read_text()
+    
+    # Vérifier si les extern sont DÉJÀ en tête (vraie déclaration, pas usage)
+    head = content[:3000]  # 3000 premiers caractères seulement
+    if 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' in head:
+        print(f"[i] {filepath} : extern déjà présents en tête")
+        return
+    
+    # Trouver le dernier #include du début
+    lines = content.split('\n')
+    last_inc = -1
+    for i, line in enumerate(lines[:300]):
+        if line.strip().startswith('#include'):
+            last_inc = i
+        elif line.strip() and not line.strip().startswith('#include') \
+             and not line.strip().startswith('//') \
+             and not line.strip().startswith('/*') \
+             and not line.strip().startswith('*') \
+             and last_inc >= 0:
+            break  # on a dépassé le bloc d'includes
+    
+    if last_inc < 0:
+        print(f"[!] {filepath} : aucun #include trouvé, insertion en ligne 0")
+        lines.insert(0, decl)
     else:
-        print("[i] fs/super.c : déjà patché")
+        lines.insert(last_inc + 1, decl)
+        print(f"[+] {filepath} : externs insérés après la ligne {last_inc + 1} (dernier #include)")
+    
+    p.write_text('\n'.join(lines))
+    print(f"    → Ligne {last_inc + 2} : {lines[last_inc + 2][:80]}")
 
-# --- fs/namespace.c ---
-if os.path.exists("fs/namespace.c"):
-    content = Path("fs/namespace.c").read_text()
-    if 'susfs_is_current_ksu_domain' not in content:
-        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-        if m:
-            content = content[:m.end()] + decl + '\n' + content[m.end():]
-            Path("fs/namespace.c").write_text(content)
-            print("[+] fs/namespace.c : déclarations SUSFS injectées")
-        else:
-            print("[!] fs/namespace.c : pas d'includes trouvés")
-    else:
-        print("[i] fs/namespace.c : déjà patché")
-
-# --- Nettoyage : supprimer les lignes "n" parasites créées par le patch ---
-for f in ["fs/namespace.c", "fs/super.c"]:
-    if os.path.exists(f):
-        content = Path(f).read_text()
-        # Supprimer les "n" en début de ligne suivi de #ifdef/#endif
-        new_content = re.sub(r'^\s*n(?=#ifdef|#endif|#include|#define|extern)', '', content, flags=re.MULTILINE)
-        if new_content != content:
-            Path(f).write_text(new_content)
-            print(f"[+] {f} : lignes 'n' parasites supprimées")
+inject_decl("fs/super.c")
+inject_decl("fs/namespace.c")
 PYEOF_SUSFS_DECL
 
-echo "✅ Déclarations SUSFS injectées"
+echo ""
+echo "=== Vérification post-injection ==="
+for f in fs/super.c fs/namespace.c; do
+    if [ -f "$f" ]; then
+        COUNT=$(grep -c "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted" "$f" 2>/dev/null || echo 0)
+        if [ "$COUNT" -gt 0 ]; then
+            echo "  ✅ $f : $COUNT extern(s) présent(s)"
+        else
+            echo "  ❌ $f : AUCUN extern trouvé !"
+        fi
+        echo "  → Lignes 1-40 de $f :"
+        head -40 "$f" | grep -n "susfs\|#include <linux/susfs" | head -10 || true
+    fi
+done
+
+# Vérifier que susfs_def.h existe
+if [ -f "include/linux/susfs_def.h" ]; then
+    echo "  ✅ include/linux/susfs_def.h existe"
+else
+    echo "  ❌ include/linux/susfs_def.h MANQUANT !"
+    find . -name "susfs_def.h" -type f 2>/dev/null | head -5
+fi
+
+echo "✅ Injection terminée"
+
 
 # ==================== 4. NEUTRALISATION DES VÉRIFICATIONS ====================
 echo ""
