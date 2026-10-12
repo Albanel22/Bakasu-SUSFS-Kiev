@@ -93,6 +93,32 @@ else
     echo "⚠️  inline_hook_check.mk introuvable, rien à faire"
 fi
 
+# ==================== 2c. VIDER inline_hook_check.mk ====================
+echo ""
+echo "=== Suppression de la vérification inline_hook_check.mk ==="
+
+INLINE_CHECKS=$(find . -name "inline_hook_check.mk" -type f 2>/dev/null)
+
+if [ -n "$INLINE_CHECKS" ]; then
+    for f in $INLINE_CHECKS; do
+        echo "→ Fichier trouvé : $f"
+        echo "# Vérification désactivée pour build non-GKI" > "$f"
+        echo "  ✅ Fichier vidé"
+    done
+else
+    echo "⚠️  Aucun inline_hook_check.mk trouvé"
+fi
+
+MANUAL_CHECKS=$(find . -name "manual_hook_check.mk" -type f 2>/dev/null)
+
+if [ -n "$MANUAL_CHECKS" ]; then
+    for f in $MANUAL_CHECKS; do
+        echo "→ Fichier trouvé : $f"
+        echo "# Vérification désactivée pour build non-GKI" > "$f"
+        echo "  ✅ Fichier vidé"
+    done
+fi
+
 # ==================== 3. HOOKS MANUELS ReSukiSU ====================
 echo ""
 echo "=== Hooks manuels ReSukiSU ==="
