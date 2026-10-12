@@ -1,7 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "=== Build BakaSU (SuSFS Inline) pour kiev ==="
+# =============================================================================
+# BUILD FINAL : LineageOS 23.2 + BakaSU (SuSFS Inline) + patchs Motorola
+# Appareil : Motorola One 5G Ace (kiev / SM8250)
+# =============================================================================
+
+echo "=== Build BakaSU (SuSFS Inline) + patches Motorola pour kiev ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -114,24 +119,13 @@ def force_inject(filepath, decl, anchor):
     if '#include <linux/susfs_def.h>' in content:
         print(f"[i] {filepath} : susfs_def.h déjà inclus"); return
     if anchor not in content:
-        print(f"❌ {filepath} : ancre introuvable")
-        for i, l in enumerate(content.split('\n')[:15], 1):
-            print(f"    L{i}: {l[:80]}")
-        return
+        print(f"❌ {filepath} : ancre introuvable"); return
     content = content.replace(anchor, anchor + '\n' + decl, 1)
     p.write_text(content)
     print(f"✅ {filepath} : inséré après '{anchor}'")
 
 force_inject("fs/super.c", decl_super, '#include "internal.h"')
 force_inject("fs/namespace.c", decl_ns, '#include "internal.h"')
-
-print()
-for f in ["fs/super.c", "fs/namespace.c"]:
-    p = Path(f)
-    if p.exists():
-        c = p.read_text()[:5000]
-        print(f"  {'✅' if '#include <linux/susfs_def.h>' in c else '❌'} {f} : susfs_def.h")
-        print(f"  {'✅' if 'extern struct static_key_true susfs_is_sdcard' in c else '❌'} {f} : extern")
 PYEOF_SUSFS_DECL
 
 # ==================== 3d. FIX fs/stat.c ====================
@@ -231,7 +225,21 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
 grep -E "KSU_MANUAL_HOOK|KSU_TRACEPOINT|KPROBES|KSU_SUSFS" out/.config || true
 
+# ==================== 5b. PATCHS MOTOROLA ====================
+echo ""
+echo "=== Patch signatures modules + tactile (APRÈS olddefconfig) ==="
+
+echo "Patch signatures modules..."
+sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
+
+echo "Patch tactile..."
+printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
+
+echo "✅ Patches Motorola appliqués"
+
 # ==================== 6. COMPILATION ====================
+echo ""
+echo "=== Compilation finale ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
 if [ -f "out/arch/arm64/boot/Image" ]; then echo "✅ Compilation réussie"; ls -lh out/arch/arm64/boot/
 else echo "❌ BUILD FAILED"; grep -iE "error:|fatal error:" build.log | head -30; exit 1; fi
@@ -269,6 +277,7 @@ echo "✅ ksud compilé"
 cd "$GITHUB_WORKSPACE"
 
 # ==================== 8. REPACK ====================
+echo "=== Repack ==="
 rm -f boot-stock.img
 if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"; fi
 if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then echo "❌ boot-stock.img invalide"; exit 1; fi
@@ -297,5 +306,6 @@ cp final_boot.img output/BakaSU-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
+echo ""
 echo "=== BUILD TERMINÉ ==="
 ls -lh output/
