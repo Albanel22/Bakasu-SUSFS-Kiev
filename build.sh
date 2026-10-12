@@ -78,7 +78,6 @@ echo "✅ SUSFS intégré"
 echo ""
 echo "=== Correction des warnings -Werror ==="
 
-# __maybe_unused sur les vma dans les fichiers SUSFS
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     if [ -f "$f" ]; then
         sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
@@ -86,10 +85,73 @@ for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
 done
 echo "  ✅ __maybe_unused appliqué"
 
-# Export KCFLAGS — uniquement des warnings qui existent en clang
 export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=unused-but-set-variable"
 echo "  ✅ KCFLAGS exporté : $KCFLAGS"
 echo "✅ Corrections terminées"
+
+# ==================== 3c. INJECTION DES DÉCLARATIONS SUSFS MANQUANTES ====================
+echo ""
+echo "=== Injection des déclarations SUSFS manquantes ==="
+
+python3 << 'PYEOF_SUSFS_DECL'
+import re
+from pathlib import Path
+import os
+
+decl = '''
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#include <linux/susfs_def.h>
+
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+
+#ifndef DEFAULT_KSU_MNT_MINOR_DEV
+#define DEFAULT_KSU_MNT_MINOR_DEV (1 << 20)
+#endif
+#endif /* CONFIG_KSU_SUSFS_SUS_MOUNT */
+'''
+
+# --- fs/super.c ---
+if os.path.exists("fs/super.c"):
+    content = Path("fs/super.c").read_text()
+    if 'susfs_is_current_ksu_domain' not in content:
+        # Insérer après le premier bloc d'includes
+        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+        if m:
+            content = content[:m.end()] + decl + '\n' + content[m.end():]
+            Path("fs/super.c").write_text(content)
+            print("[+] fs/super.c : déclarations SUSFS injectées")
+        else:
+            print("[!] fs/super.c : pas d'includes trouvés")
+    else:
+        print("[i] fs/super.c : déjà patché")
+
+# --- fs/namespace.c ---
+if os.path.exists("fs/namespace.c"):
+    content = Path("fs/namespace.c").read_text()
+    if 'susfs_is_current_ksu_domain' not in content:
+        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+        if m:
+            content = content[:m.end()] + decl + '\n' + content[m.end():]
+            Path("fs/namespace.c").write_text(content)
+            print("[+] fs/namespace.c : déclarations SUSFS injectées")
+        else:
+            print("[!] fs/namespace.c : pas d'includes trouvés")
+    else:
+        print("[i] fs/namespace.c : déjà patché")
+
+# --- Nettoyage : supprimer les lignes "n" parasites créées par le patch ---
+for f in ["fs/namespace.c", "fs/super.c"]:
+    if os.path.exists(f):
+        content = Path(f).read_text()
+        # Supprimer les "n" en début de ligne suivi de #ifdef/#endif
+        new_content = re.sub(r'^\s*n(?=#ifdef|#endif|#include|#define|extern)', '', content, flags=re.MULTILINE)
+        if new_content != content:
+            Path(f).write_text(new_content)
+            print(f"[+] {f} : lignes 'n' parasites supprimées")
+PYEOF_SUSFS_DECL
+
+echo "✅ Déclarations SUSFS injectées"
 
 # ==================== 4. NEUTRALISATION DES VÉRIFICATIONS ====================
 echo ""
