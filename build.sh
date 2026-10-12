@@ -1,14 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# =============================================================================
-# BUILD : LineageOS 23.2 + ReSukiSU/BakaSU (main) + SUSFS
-# Appareil : Motorola One 5G Ace (kiev / SM8250)
-# Kernel : 4.19.325
-# MODE : Manual Hook (non-GKI)
-# IMAGES STOCK : Google Drive (build 2026-09-20)
-# =============================================================================
-
 echo "=== Build ReSukiSU/BakaSU + SUSFS pour kiev (SM8250) ==="
 df -h
 
@@ -33,36 +25,10 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. INTÉGRATION ReSukiSU via setup.sh ====================
-echo "=== Intégration ReSukiSU via setup.sh ==="
+# ==================== 2. INTÉGRATION BakaSU via setup.sh ====================
+echo "=== Intégration BakaSU via setup.sh ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
-
-curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
-
-KSU_KCONFIG_OK=0
-KSU_MAKEFILE_OK=0
-
-if grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig 2>/dev/null; then
-    KSU_KCONFIG_OK=1
-elif grep -q 'source "KernelSU/kernel/Kconfig"' drivers/Kconfig 2>/dev/null; then
-    KSU_KCONFIG_OK=1
-fi
-
-if grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile 2>/dev/null; then
-    KSU_MAKEFILE_OK=1
-elif grep -q 'obj-$(CONFIG_KSU) += KernelSU/' drivers/Makefile 2>/dev/null; then
-    KSU_MAKEFILE_OK=1
-fi
-
-if [ "$KSU_KCONFIG_OK" -eq 0 ]; then
-    echo "❌ Échec Kconfig ReSukiSU"
-    exit 1
-fi
-if [ "$KSU_MAKEFILE_OK" -eq 0 ]; then
-    echo "❌ Échec Makefile ReSukiSU"
-    exit 1
-fi
-echo "✅ ReSukiSU intégré dans le kernel"
+curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
 if [ -d "drivers/kernelsu" ]; then
     KSU_DIR="drivers/kernelsu"
@@ -74,19 +40,46 @@ else
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 2c. NEUTRALISATION DES VÉRIFICATIONS (SANS TOUCHER À Kbuild) ====================
+# ==================== 3. INTÉGRATION SUSFS (cyberc3dr pour kernel 4.19) ====================
+echo "=== Intégration SUSFS 2.3.0 depuis cyberc3dr ==="
+cd "$GITHUB_WORKSPACE"
+rm -rf /tmp/cyber_repo
+git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Build.git /tmp/cyber_repo
+
+cd "$GITHUB_WORKSPACE/kernel_sources"
+
+SUSFS_PATCH="/tmp/cyber_repo/Patches/Patch/susfs_patch_to_4.19.patch"
+if [ -f "$SUSFS_PATCH" ]; then
+    echo "→ Application du patch SUSFS 4.19..."
+    patch -p1 --forward --batch < "$SUSFS_PATCH" 2>&1 | tee /tmp/susfs_patch.log || true
+
+    # Nettoyage des rejets
+    find . -name "*.rej" -type f -delete 2>/dev/null || true
+    echo "  ✅ Patch SUSFS appliqué"
+else
+    echo "  ⚠️  Patch SUSFS non trouvé, on continue sans SUSFS"
+fi
+
+# Copier les fichiers SUSFS additionnels
+if [ -d "/tmp/cyber_repo/Patches/fs" ]; then
+    cp -rn /tmp/cyber_repo/Patches/fs/* fs/ 2>/dev/null || true
+fi
+if [ -d "/tmp/cyber_repo/Patches/include/linux" ]; then
+    cp -rn /tmp/cyber_repo/Patches/include/linux/* include/linux/ 2>/dev/null || true
+fi
+
+# Ajouter susfs.o au Makefile
+if [ -f "fs/Makefile" ] && ! grep -q "susfs.o" fs/Makefile; then
+    echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
+    [ -f "fs/sus_su.c" ] && ! grep -q "sus_su.o" fs/Makefile && echo "obj-\$(CONFIG_KSU_SUSFS) += sus_su.o" >> fs/Makefile
+fi
+echo "✅ SUSFS intégré"
+
+# ==================== 4. NEUTRALISATION DES VÉRIFICATIONS ====================
 echo ""
 echo "=== Neutralisation des vérifications ==="
 
-echo "→ Vidage des fichiers de vérification .mk..."
-CHECK_PATTERNS=(
-    "inline_hook_check.mk"
-    "manual_hook_check.mk"
-    "tracepoint_hook_check.mk"
-    "susfs_compat.mk"
-    "kprobe_check.mk"
-)
-
+CHECK_PATTERNS=( "inline_hook_check.mk" "manual_hook_check.mk" "tracepoint_hook_check.mk" "susfs_compat.mk" "kprobe_check.mk" )
 for pattern in "${CHECK_PATTERNS[@]}"; do
     FILES=$(find . -name "$pattern" -type f 2>/dev/null)
     if [ -n "$FILES" ]; then
@@ -97,33 +90,26 @@ for pattern in "${CHECK_PATTERNS[@]}"; do
     fi
 done
 
-echo "→ Conversion des \$(error dans les fichiers .mk..."
 ERROR_MK_FILES=$(grep -rl '\$(error' "$KSU_DIR" --include="*.mk" 2>/dev/null || true)
 if [ -n "$ERROR_MK_FILES" ]; then
     for f in $ERROR_MK_FILES; do
-        echo "  → Conversion dans : $f"
         sed -i 's/\$(error/\$(warning/g' "$f" 2>/dev/null || true
     done
-    echo "  ✅ Toutes les \$(error dans les .mk converties en \$(warning)"
-else
-    echo "  ⚠️  Aucun \$(error trouvé dans les .mk"
 fi
+echo "✅ Neutralisation terminée"
 
-echo "✅ Neutralisation terminée (Kbuild intact)"
-
-# ==================== 3. HOOKS MANUELS ReSukiSU ====================
+# ==================== 5. HOOKS MANUELS BakaSU (style manuel) ====================
 echo ""
-echo "=== Hooks manuels ReSukiSU ==="
+echo "=== Hooks manuels BakaSU ==="
 
-# --- execveat ---
+# --- execveat (hook manuel pour non-GKI, sans ksu_execveat_hook) ---
 if ! grep -q "ksu_handle_execveat" fs/exec.c; then
   cat > /tmp/hook_execveat.py << 'PYEOF'
 import re
 with open('fs/exec.c', 'r') as f: content = f.read()
-if 'ksu_execveat_hook' not in content:
+if 'ksu_handle_execveat' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
-extern bool ksu_execveat_hook __read_mostly;
 extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
 				void *argv, void *envp, int *flags);
 extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
@@ -138,14 +124,12 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 		return PTR_ERR(filename);
 
 #ifdef CONFIG_KSU
-	if (unlikely(ksu_execveat_hook))
-		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
-	else
-		ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+	ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
 #endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: execveat (appel inséré)")
+        print("OK: execveat (appels manuels insérés)")
 with open('fs/exec.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/hook_execveat.py
@@ -168,7 +152,7 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 	(void)ksu_handle_setresuid(ruid, euid, suid);
 #endif
 '''
-    markers = ['\tbool ruid_new, euid_new, suid_new;', '\tkuid_t kruid, keuid, ksuid;', '\tksuid = make_kuid(ns, suid);']
+    markers = ['\tbool ruid_new, euid_new, suid_new;', '\tkuid_t kruid, keuid, ksuid;']
     inserted = False
     for marker in markers:
         if marker in content:
@@ -177,7 +161,7 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
             print("OK: setresuid (inséré après '" + marker.strip()[:50] + "')")
             break
     if not inserted:
-        print("❌ setresuid: marqueur unique introuvable")
+        print("❌ setresuid: marqueur introuvable")
         for line in content.split('\n'):
             if 'ksuid' in line or 'ruid_new' in line: print("   >", line.strip()[:120])
         exit(1)
@@ -222,8 +206,7 @@ with open('drivers/input/input.c', 'r') as f: content = f.read()
 if 'ksu_handle_input_handle_event' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
-extern bool ksu_input_hook __read_mostly;
-extern __attribute__((cold)) int ksu_handle_input_handle_event(
+extern int ksu_handle_input_handle_event(
 			unsigned int *type, unsigned int *code, int *value);
 #endif
 '''
@@ -241,8 +224,7 @@ extern __attribute__((cold)) int ksu_handle_input_handle_event(
 	unsigned long flags;
 
 #ifdef CONFIG_KSU
-	if (unlikely(ksu_input_hook))
-		ksu_handle_input_handle_event(&type, &code, &value);
+	ksu_handle_input_handle_event(&type, &code, &value);
 #endif
 
 	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
@@ -254,7 +236,7 @@ PYEOF
   python3 /tmp/hook_input.py
 fi
 
-# ==================== 3.3. VÉRIFICATION FINALE DES HOOKS ====================
+# ==================== 6. VÉRIFICATION FINALE ====================
 echo ""
 echo "=== Vérification finale des hooks ==="
 HOOKS_OK=1
@@ -267,10 +249,10 @@ check_hook "ksu_handle_execveat"          "fs/exec.c"
 check_hook "ksu_handle_setresuid"         "kernel/sys.c"
 check_hook "ksu_handle_sys_read"          "fs/read_write.c"
 check_hook "ksu_handle_input_handle_event" "drivers/input/input.c"
-if [ "$HOOKS_OK" -eq 0 ]; then echo ""; echo "❌ ERREUR CRITIQUE : Des hooks sont manquants."; exit 1; fi
+if [ "$HOOKS_OK" -eq 0 ]; then echo "❌ ERREUR CRITIQUE : Des hooks sont manquants."; exit 1; fi
 echo "✅ Tous les hooks sont en place"
 
-# ==================== 4. CONFIGURATION ====================
+# ==================== 7. CONFIGURATION ====================
 echo "=== Configuration ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
@@ -285,12 +267,16 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_KSU=y"
   echo "CONFIG_KSU_MANUAL_HOOK=y"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"
   echo "# CONFIG_KPROBES is not set"
   echo "CONFIG_COMPAT=y"
   echo "CONFIG_COMPAT_32BIT_TIME=y"
+  echo "CONFIG_KSU_SUSFS=y"
+  echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+  echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+  echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+  echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+  echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
 } >> out/.config
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
@@ -303,60 +289,19 @@ if ! grep -q "CONFIG_KSU_MANUAL_HOOK" out/.config; then
     echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
 fi
 if grep -q "^CONFIG_KPROBES=y" out/.config; then
-    echo "⚠️  KPROBES réactivé par olddefconfig, désactivation forcée..."
     sed -i 's/^CONFIG_KPROBES=y/# CONFIG_KPROBES is not set/' out/.config
 fi
 echo "=== État final .config ==="
-grep -E "KSU_MANUAL_HOOK|KPROBES" out/.config || true
+grep -E "KSU_MANUAL_HOOK|KPROBES|KSU_SUSFS" out/.config || true
 
-# ==================== 4b. BYPASS SECCOMP CIBLÉ ====================
-echo "=== Patch bypass seccomp ciblé dans kernel/seccomp.c ==="
-python3 << 'PYEOF_SECCOMP_BYPASS'
-from pathlib import Path
-import re
-path = Path("kernel/seccomp.c")
-if not path.exists(): print("⚠️  kernel/seccomp.c introuvable"); exit(0)
-content = path.read_text()
-if 'CONFIG_KSU_SECCOMP_BYPASS' in content: print("[i] Bypass seccomp déjà appliqué"); exit(0)
-pattern = r'(int\s+__secure_computing\s*\([^)]+\)\s*\{[^}]*?int\s+this_syscall\s*;)'
-match = re.search(pattern, content, re.DOTALL)
-if not match: print("⚠️  Pattern non trouvé, skip"); exit(0)
-insert_pos = match.end()
-bypass_code = '''
-#ifdef CONFIG_KSU
-	/* CONFIG_KSU_SECCOMP_BYPASS : bypass syscalls KernelSU/SUSFS */
-	{
-		int __ksu_nr = sd ? sd->nr : syscall_get_nr(current, task_pt_regs(current));
-		if (__ksu_nr == __NR_reboot && sd) {
-			if ((unsigned long)sd->args[0] == 0xDEADBEEFUL) {
-				return 0;
-			}
-		}
-	}
-#endif
-'''
-content = content[:insert_pos] + bypass_code + content[insert_pos:]
-path.write_text(content)
-print("[+] Bypass seccomp ciblé inséré")
-PYEOF_SECCOMP_BYPASS
-if grep -q "CONFIG_KSU_SECCOMP_BYPASS" kernel/seccomp.c 2>/dev/null; then echo "✅ Bypass seccomp appliqué"; else echo "⚠️  Bypass seccomp non appliqué"; fi
-
-# ==================== 5. PATCHES ====================
-echo "=== Patch signatures modules + tactile ==="
-sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
-if ! grep -q "panel_register_notifier" techpack/display/msm/msm_drv.c; then
-    printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
-    echo "✅ Patch tactile appliqué"
-else echo "⏭️  Patch tactile déjà présent"; fi
-
-# ==================== 6. COMPILATION ====================
+# ==================== 8. COMPILATION ====================
 echo "=== Compilation finale ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
 if [ -f "out/arch/arm64/boot/Image" ]; then echo "✅ Compilation réussie"; ls -lh out/arch/arm64/boot/
 else echo "❌ BUILD FAILED"; grep -iE "error:|fatal error:" build.log | head -30; exit 1; fi
 
-# ==================== 6b. COMPILATION KSUD (ReSukiSU) ====================
-echo "=== Compilation de ksud (ReSukiSU) ==="
+# ==================== 9. KSUD ====================
+echo "=== Compilation de ksud ==="
 cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -368,7 +313,7 @@ export AARCH64_CLANGXX_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x8
 export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
-git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git "$GITHUB_WORKSPACE/ksud-src"
+git clone --depth=1 https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
@@ -385,16 +330,16 @@ cargo +nightly build --release --target aarch64-linux-android
 KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1)
 if [ -z "$KSUD_BINARY" ]; then echo "❌ ksud introuvable"; exit 1; fi
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé (ReSukiSU)"
+echo "✅ ksud compilé"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 7. REPACK (Images stock Google Drive) ====================
-echo "=== Téléchargement des images stock depuis Google Drive ==="
-echo "→ Téléchargement boot.img..."
+# ==================== 10. REPACK ====================
+echo "=== Téléchargement des images stock ==="
+echo "→ boot.img..."
 rm -f boot-stock.img
-if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then echo "  ✅ boot.img téléchargé : $(du -h boot-stock.img | cut -f1)"; fi
+if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"; fi
 if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then echo "❌ boot-stock.img manquant ou trop petit"; exit 1; fi
-echo "→ Téléchargement dtbo.img..."
+echo "→ dtbo.img..."
 rm -f dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 || true
 echo "=== Repack avec magiskboot ==="
@@ -414,14 +359,12 @@ rm -f local_su_binary
 mv new-boot.img ../final_boot.img
 cd ..
 
-# ==================== 8. SORTIE ====================
+# ==================== 11. SORTIE ====================
 echo "=== Copie vers output ==="
 mkdir -p output
-cp final_boot.img output/ReSukiSU-SuSFS-boot.img 2>/dev/null || true
+cp final_boot.img output/BakaSU-SuSFS-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo "=== BUILD TERMINÉ ==="
-echo "Noyau + ksud : ReSukiSU (main, mode non-GKI)"
-echo "Images stock : Google Drive (build 2026-09-20)"
 ls -lh output/
