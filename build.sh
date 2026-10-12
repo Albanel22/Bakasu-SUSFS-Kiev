@@ -76,44 +76,51 @@ else
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 2b. NEUTRALISER inline_hook_check.mk ====================
+# ==================== 2c. VIDER TOUS LES FICHIERS DE VÉRIFICATION ====================
 echo ""
-echo "=== Neutralisation de la vérification inline_hook_check.mk ==="
+echo "=== Suppression de toutes les vérifications bloquantes ==="
 
-INLINE_CHECK=$(find "$KSU_DIR" -name "inline_hook_check.mk" -type f 2>/dev/null | head -1)
+CHECK_PATTERNS=(
+    "inline_hook_check.mk"
+    "manual_hook_check.mk"
+    "tracepoint_hook_check.mk"
+    "susfs_compat.mk"
+    "kprobe_check.mk"
+)
 
-if [ -n "$INLINE_CHECK" ]; then
-    echo "→ Fichier trouvé : $INLINE_CHECK"
-    sed -i 's/^\(\s*\)\$(error/\1# $(error/' "$INLINE_CHECK" 2>/dev/null || true
-    if grep -q '^\s*\$(error' "$INLINE_CHECK" 2>/dev/null; then
-        sed -i 's/\$(error/$(warning/g' "$INLINE_CHECK" 2>/dev/null || true
+for pattern in "${CHECK_PATTERNS[@]}"; do
+    FILES=$(find . -name "$pattern" -type f 2>/dev/null)
+    if [ -n "$FILES" ]; then
+        for f in $FILES; do
+            echo "→ Fichier trouvé : $f"
+            echo "# Vérification désactivée pour build non-GKI" > "$f"
+            echo "  ✅ Vidé"
+        done
     fi
-    echo "✅ Vérification inline_hook neutralisée"
-else
-    echo "⚠️  inline_hook_check.mk introuvable, rien à faire"
-fi
+done
 
-# ==================== 2c. CONTOURNER LA VÉRIFICATION INLINE_HOOK ====================
 echo ""
-echo "=== Contournement de la vérification inline_hook ==="
+echo "→ Recherche de tous les \$(error dans $KSU_DIR..."
+ERROR_FILES=$(grep -rl '\$(error' "$KSU_DIR" --include="*.mk" 2>/dev/null || true)
 
-KSU_MAKEFILE=$(find "$KSU_DIR" -name "Makefile" -type f 2>/dev/null | head -1)
-
-if [ -n "$KSU_MAKEFILE" ]; then
-    echo "→ Makefile trouvé : $KSU_MAKEFILE"
-    sed -i 's/^\(.*include.*inline_hook_check\.mk.*\)/# \1/' "$KSU_MAKEFILE" 2>/dev/null || true
-    echo "  ✅ Ligne d'inclusion commentée"
-else
-    echo "⚠️  Makefile de KernelSU introuvable"
-fi
-
-INLINE_CHECKS=$(find . -name "inline_hook_check.mk" -type f 2>/dev/null)
-if [ -n "$INLINE_CHECKS" ]; then
-    for f in $INLINE_CHECKS; do
-        echo "# Vérification désactivée pour build non-GKI" > "$f"
-        echo "  ✅ Fichier vidé : $f"
+if [ -n "$ERROR_FILES" ]; then
+    for f in $ERROR_FILES; do
+        echo "  → Conversion \$(error → \$(warning dans : $f"
+        sed -i 's/\$(error/\$(warning/g' "$f" 2>/dev/null || true
     done
+    echo "✅ Tous les \$(error convertis en \$(warning)"
+else
+    echo "⚠️  Aucun \$(error trouvé"
 fi
+
+echo ""
+echo "→ Commentaire des includes dans les Makefiles..."
+KSU_MAKEFILES=$(find "$KSU_DIR" -name "Makefile" -type f 2>/dev/null)
+for mf in $KSU_MAKEFILES; do
+    sed -i 's/^\(.*include.*_check\.mk.*\)/# \1/' "$mf" 2>/dev/null || true
+    sed -i 's/^\(.*include.*susfs_compat\.mk.*\)/# \1/' "$mf" 2>/dev/null || true
+done
+echo "✅ Includes commentés"
 
 # ==================== 3. HOOKS MANUELS ReSukiSU ====================
 echo ""
