@@ -73,13 +73,18 @@ done
 export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=unused-but-set-variable"
 echo "✅ KCFLAGS exporté"
 
-# ==================== 3c. DÉCLARATIONS EXTERNES ====================
-echo "=== Injection déclarations externes SUSFS ==="
+# ==================== 3c. INCLUDE + DÉCLARATIONS SUSFS ====================
+echo ""
+echo "=== Injection include + déclarations SUSFS ==="
 
 python3 << 'PYEOF_SUSFS_DECL'
 from pathlib import Path
 
 decl_super = '''
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif
+
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 extern bool susfs_is_current_ksu_domain(void);
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
@@ -87,6 +92,10 @@ extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
 '''
 
 decl_ns = '''
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif
+
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 extern bool susfs_is_current_ksu_domain(void);
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
@@ -99,57 +108,58 @@ extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
 
 def force_inject(filepath, decl, anchor):
     p = Path(filepath)
-    if not p.exists(): return
+    if not p.exists():
+        print(f"❌ {filepath} : introuvable"); return
     content = p.read_text()
-    if 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' in content[:5000]:
-        print(f"[i] {filepath} : déjà patché"); return
+    if '#include <linux/susfs_def.h>' in content:
+        print(f"[i] {filepath} : susfs_def.h déjà inclus"); return
     if anchor not in content:
-        print(f"❌ {filepath} : ancre introuvable"); return
+        print(f"❌ {filepath} : ancre introuvable")
+        for i, l in enumerate(content.split('\n')[:15], 1):
+            print(f"    L{i}: {l[:80]}")
+        return
     content = content.replace(anchor, anchor + '\n' + decl, 1)
     p.write_text(content)
-    print(f"✅ {filepath} : déclarations insérées")
+    print(f"✅ {filepath} : inséré après '{anchor}'")
 
 force_inject("fs/super.c", decl_super, '#include "internal.h"')
 force_inject("fs/namespace.c", decl_ns, '#include "internal.h"')
+
+print()
+for f in ["fs/super.c", "fs/namespace.c"]:
+    p = Path(f)
+    if p.exists():
+        c = p.read_text()[:5000]
+        print(f"  {'✅' if '#include <linux/susfs_def.h>' in c else '❌'} {f} : susfs_def.h")
+        print(f"  {'✅' if 'extern struct static_key_true susfs_is_sdcard' in c else '❌'} {f} : extern")
 PYEOF_SUSFS_DECL
 
-# ==================== 3d. FIX INCLUDE MANQUANT fs/stat.c (BUG CYBERC3DR) ====================
+# ==================== 3d. FIX fs/stat.c ====================
 echo ""
-echo "=== Fix bug cyberc3dr : include manquant dans fs/stat.c ==="
+echo "=== Fix include manquant dans fs/stat.c ==="
 
 python3 << 'PYEOF_STAT_FIX'
 from pathlib import Path
-
 p = Path("fs/stat.c")
 if not p.exists():
-    print("❌ fs/stat.c introuvable")
-    exit(0)
-
+    print("❌ fs/stat.c introuvable"); exit(0)
 content = p.read_text()
-
 if '#include <linux/susfs_def.h>' in content:
-    print("[i] fs/stat.c : include déjà présent")
+    print("[i] fs/stat.c : déjà patché")
 else:
     anchor = '#include <asm/unistd.h>'
     if anchor in content:
-        content = content.replace(
-            anchor,
-            anchor + '\n\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif',
-            1
-        )
+        content = content.replace(anchor,
+            anchor + '\n\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif', 1)
         p.write_text(content)
-        print("✅ fs/stat.c : include inséré après <asm/unistd.h>")
+        print("✅ fs/stat.c : susfs_def.h inséré")
     else:
-        print("❌ ancre '<asm/unistd.h>' introuvable")
-
-c = p.read_text()
-for sym in ['susfs_def.h', 'susfs_is_current_app_uid', 'STATX_SUS_KSTAT', 'STATX_SUS_KSTAT_FUSE']:
-    print(f"  {'✅' if sym in c else '❌'} {sym}")
+        print("❌ fs/stat.c : ancre introuvable")
 PYEOF_STAT_FIX
 
 # ==================== 4. NEUTRALISATION ====================
 echo ""
-echo "=== Neutralisation des vérifications ==="
+echo "=== Neutralisation ==="
 CHECK_PATTERNS=( "inline_hook_check.mk" "manual_hook_check.mk" "tracepoint_hook_check.mk" "susfs_compat.mk" "kprobe_check.mk" )
 for pattern in "${CHECK_PATTERNS[@]}"; do
     FILES=$(find . -name "$pattern" -type f 2>/dev/null)
