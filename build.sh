@@ -93,29 +93,25 @@ else
     echo "⚠️  inline_hook_check.mk introuvable, rien à faire"
 fi
 
-# ==================== 2c. VIDER inline_hook_check.mk ====================
+# ==================== 2c. CONTOURNER LA VÉRIFICATION INLINE_HOOK ====================
 echo ""
-echo "=== Suppression de la vérification inline_hook_check.mk ==="
+echo "=== Contournement de la vérification inline_hook ==="
 
-INLINE_CHECKS=$(find . -name "inline_hook_check.mk" -type f 2>/dev/null)
+KSU_MAKEFILE=$(find "$KSU_DIR" -name "Makefile" -type f 2>/dev/null | head -1)
 
-if [ -n "$INLINE_CHECKS" ]; then
-    for f in $INLINE_CHECKS; do
-        echo "→ Fichier trouvé : $f"
-        echo "# Vérification désactivée pour build non-GKI" > "$f"
-        echo "  ✅ Fichier vidé"
-    done
+if [ -n "$KSU_MAKEFILE" ]; then
+    echo "→ Makefile trouvé : $KSU_MAKEFILE"
+    sed -i 's/^\(.*include.*inline_hook_check\.mk.*\)/# \1/' "$KSU_MAKEFILE" 2>/dev/null || true
+    echo "  ✅ Ligne d'inclusion commentée"
 else
-    echo "⚠️  Aucun inline_hook_check.mk trouvé"
+    echo "⚠️  Makefile de KernelSU introuvable"
 fi
 
-MANUAL_CHECKS=$(find . -name "manual_hook_check.mk" -type f 2>/dev/null)
-
-if [ -n "$MANUAL_CHECKS" ]; then
-    for f in $MANUAL_CHECKS; do
-        echo "→ Fichier trouvé : $f"
+INLINE_CHECKS=$(find . -name "inline_hook_check.mk" -type f 2>/dev/null)
+if [ -n "$INLINE_CHECKS" ]; then
+    for f in $INLINE_CHECKS; do
         echo "# Vérification désactivée pour build non-GKI" > "$f"
-        echo "  ✅ Fichier vidé"
+        echo "  ✅ Fichier vidé : $f"
     done
 fi
 
