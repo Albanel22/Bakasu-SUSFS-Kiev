@@ -45,7 +45,7 @@ else
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 3. INTÉGRATION SUSFS (obligatoire pour SuSFS Inline) ====================
+# ==================== 3. INTÉGRATION SUSFS ====================
 echo "=== Intégration SUSFS depuis cyberc3dr ==="
 cd "$GITHUB_WORKSPACE"
 rm -rf /tmp/cyber_repo
@@ -74,10 +74,11 @@ if [ -f "fs/Makefile" ] && ! grep -q "susfs.o" fs/Makefile; then
 fi
 echo "✅ SUSFS intégré"
 
-# ==================== 3b. FIX warnings -Werror ====================
+# ==================== 3b. FIX warnings -Werror (KCFLAGS uniquement) ====================
 echo ""
 echo "=== Correction des warnings -Werror ==="
 
+# __maybe_unused sur les vma dans les fichiers SUSFS
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     if [ -f "$f" ]; then
         sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
@@ -85,17 +86,12 @@ for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
 done
 echo "  ✅ __maybe_unused appliqué"
 
-if [ -f "Makefile" ] && ! grep -q "no-error=unused-variable" Makefile; then
-    sed -i 's/^\(KBUILD_CFLAGS   := .*\)$/\1 -Wno-error=unused-variable/' Makefile
-    if ! grep -q "no-error=unused-variable" Makefile; then
-        echo "KBUILD_CFLAGS += -Wno-error=unused-variable" >> Makefile
-    fi
-    echo "  ✅ -Wno-error=unused-variable ajouté"
-fi
-export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=maybe-uninitialized"
+# Export KCFLAGS — méthode propre, ne touche PAS au Makefile
+export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=maybe-uninitialized -Wno-error=unused-but-set-variable"
+echo "  ✅ KCFLAGS exporté : $KCFLAGS"
 echo "✅ Corrections terminées"
 
-# ==================== 4. NEUTRALISATION DES VÉRIFICATIONS .mk ====================
+# ==================== 4. NEUTRALISATION DES VÉRIFICATIONS ====================
 echo ""
 echo "=== Neutralisation des vérifications ==="
 
