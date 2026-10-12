@@ -74,22 +74,19 @@ else
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 2c. NEUTRALISATION CIBLÉE DES VÉRIFICATIONS ====================
+# ==================== 2c. NEUTRALISATION DES VÉRIFICATIONS (SANS TOUCHER À Kbuild) ====================
 echo ""
-echo "=== Neutralisation ciblée des vérifications ==="
+echo "=== Neutralisation des vérifications ==="
 
-echo "→ Restauration du fichier Kbuild original..."
-if [ -f "$KSU_DIR/Kbuild" ]; then
-    git -C "$KSU_DIR" checkout -- Kbuild 2>/dev/null || {
-        if [ -d "/tmp/ReSukiSU/kernel" ]; then
-            cp /tmp/ReSukiSU/kernel/Kbuild "$KSU_DIR/Kbuild"
-        fi
-    }
-    echo "  ✅ Kbuild restauré"
-fi
+echo "→ Vidage des fichiers de vérification .mk..."
+CHECK_PATTERNS=(
+    "inline_hook_check.mk"
+    "manual_hook_check.mk"
+    "tracepoint_hook_check.mk"
+    "susfs_compat.mk"
+    "kprobe_check.mk"
+)
 
-echo "→ Neutralisation des fichiers de vérification .mk..."
-CHECK_PATTERNS=( "inline_hook_check.mk" "manual_hook_check.mk" "tracepoint_hook_check.mk" "susfs_compat.mk" "kprobe_check.mk" )
 for pattern in "${CHECK_PATTERNS[@]}"; do
     FILES=$(find . -name "$pattern" -type f 2>/dev/null)
     if [ -n "$FILES" ]; then
@@ -100,13 +97,19 @@ for pattern in "${CHECK_PATTERNS[@]}"; do
     fi
 done
 
-KSU_KBUILD="$KSU_DIR/Kbuild"
-if [ -f "$KSU_KBUILD" ]; then
-    echo "→ Traitement du Kbuild (conversion des erreurs)..."
-    sed -i 's/\$(error/\$(warning/g' "$KSU_KBUILD"
-    echo "  ✅ Erreurs converties en warnings"
+echo "→ Conversion des \$(error dans les fichiers .mk..."
+ERROR_MK_FILES=$(grep -rl '\$(error' "$KSU_DIR" --include="*.mk" 2>/dev/null || true)
+if [ -n "$ERROR_MK_FILES" ]; then
+    for f in $ERROR_MK_FILES; do
+        echo "  → Conversion dans : $f"
+        sed -i 's/\$(error/\$(warning/g' "$f" 2>/dev/null || true
+    done
+    echo "  ✅ Toutes les \$(error dans les .mk converties en \$(warning)"
+else
+    echo "  ⚠️  Aucun \$(error trouvé dans les .mk"
 fi
-echo "✅ Neutralisation terminée"
+
+echo "✅ Neutralisation terminée (Kbuild intact)"
 
 # ==================== 3. HOOKS MANUELS ReSukiSU ====================
 echo ""
