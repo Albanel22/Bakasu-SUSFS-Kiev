@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# BUILD : LineageOS 23.2 + BakaSU + SUSFS (kernel 4.19 non-GKI)
+# BUILD : LineageOS 23.2 + BakaSU (SuSFS Inline) pour kernel 4.19 non-GKI
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
 # =============================================================================
 
-echo "=== Build BakaSU + SUSFS pour kiev (SM8250) ==="
+echo "=== Build BakaSU (SuSFS Inline) pour kiev ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -30,7 +30,7 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. INTÉGRATION BakaSU via setup.sh ====================
+# ==================== 2. INTÉGRATION BakaSU ====================
 echo "=== Intégration BakaSU via setup.sh ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
@@ -40,12 +40,12 @@ if [ -d "drivers/kernelsu" ]; then
 elif [ -d "KernelSU" ]; then
     KSU_DIR="KernelSU"
 else
-    echo "❌ Impossible de trouver le dossier KernelSU après setup"
+    echo "❌ Impossible de trouver le dossier KernelSU"
     exit 1
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 3. INTÉGRATION SUSFS (cyberc3dr pour kernel 4.19) ====================
+# ==================== 3. INTÉGRATION SUSFS (obligatoire pour SuSFS Inline) ====================
 echo "=== Intégration SUSFS depuis cyberc3dr ==="
 cd "$GITHUB_WORKSPACE"
 rm -rf /tmp/cyber_repo
@@ -74,47 +74,28 @@ if [ -f "fs/Makefile" ] && ! grep -q "susfs.o" fs/Makefile; then
 fi
 echo "✅ SUSFS intégré"
 
-# ==================== 3b. FIX unused variable + désactivation -Werror ciblée ====================
+# ==================== 3b. FIX warnings -Werror ====================
 echo ""
-echo "=== Correction des warnings qui bloquent le build ==="
-
-# 1. Fix __maybe_unused sur vma dans les fichiers SUSFS
-if [ -f "fs/proc/task_mmu.c" ]; then
-    sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' fs/proc/task_mmu.c
-    echo "  ✅ 'vma' marquée __maybe_unused dans task_mmu.c"
-fi
+echo "=== Correction des warnings -Werror ==="
 
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     if [ -f "$f" ]; then
         sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
     fi
 done
-echo "  ✅ Vérification __maybe_unused terminée"
+echo "  ✅ __maybe_unused appliqué"
 
-# 2. Désactiver -Werror pour unused-variable dans le Makefile principal
-#    Cela empêche TOUT warning 'unused-variable' de bloquer le build
-if [ -f "Makefile" ]; then
+if [ -f "Makefile" ] && ! grep -q "no-error=unused-variable" Makefile; then
+    sed -i 's/^\(KBUILD_CFLAGS   := .*\)$/\1 -Wno-error=unused-variable/' Makefile
     if ! grep -q "no-error=unused-variable" Makefile; then
-        echo "  → Ajout de -Wno-error=unused-variable dans le Makefile principal"
-        # Chercher la ligne KBUILD_CFLAGS := -Wall ... et ajouter l'option
-        sed -i 's/^\(KBUILD_CFLAGS   := .*\)$/\1 -Wno-error=unused-variable/' Makefile
-        # Fallback si la ligne n'a pas été trouvée
-        if ! grep -q "no-error=unused-variable" Makefile; then
-            echo "  ⚠️  Pattern KBUILD_CFLAGS non trouvé, ajout direct"
-            echo "KBUILD_CFLAGS += -Wno-error=unused-variable" >> Makefile
-        fi
-        echo "  ✅ -Wno-error=unused-variable ajouté"
-    else
-        echo "  ⏭️  -Wno-error=unused-variable déjà présent"
+        echo "KBUILD_CFLAGS += -Wno-error=unused-variable" >> Makefile
     fi
+    echo "  ✅ -Wno-error=unused-variable ajouté"
 fi
-
-# 3. Au cas où, désactiver aussi via KCFLAGS exporté
 export KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function -Wno-error=maybe-uninitialized"
-echo "  ✅ KCFLAGS exporté : $KCFLAGS"
 echo "✅ Corrections terminées"
 
-# ==================== 4. NEUTRALISATION DES VÉRIFICATIONS ====================
+# ==================== 4. NEUTRALISATION DES VÉRIFICATIONS .mk ====================
 echo ""
 echo "=== Neutralisation des vérifications ==="
 
@@ -123,7 +104,7 @@ for pattern in "${CHECK_PATTERNS[@]}"; do
     FILES=$(find . -name "$pattern" -type f 2>/dev/null)
     if [ -n "$FILES" ]; then
         for f in $FILES; do
-            echo "  → Vidage de : $f"
+            echo "  → Vidage : $f"
             echo "# Vérification désactivée pour build non-GKI" > "$f"
         done
     fi
@@ -137,161 +118,61 @@ if [ -n "$ERROR_MK_FILES" ]; then
 fi
 echo "✅ Neutralisation terminée"
 
-# ==================== 5. HOOKS MANUELS BakaSU ====================
-echo ""
-echo "=== Hooks manuels BakaSU ==="
+# ==================== 4b. PATCH app_profile.c (compat seccomp) ====================
+echo "=== Patch compatibilité disable_seccomp() ==="
 
-# --- execveat ---
-if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-  cat > /tmp/hook_execveat.py << 'PYEOF'
+python3 << 'PYEOF_SECCOMP_FIX'
 import re
-with open('fs/exec.c', 'r') as f: content = f.read()
-if 'ksu_handle_execveat' not in content:
-    extern_decl = '''
-#ifdef CONFIG_KSU
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-				void *argv, void *envp, int *flags);
-extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
-				 void *argv, void *envp, int *flags);
-#endif
-'''
-    match = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if match: content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
-    old_code = '''	if (IS_ERR(filename))
-		return PTR_ERR(filename);'''
-    new_code = '''	if (IS_ERR(filename))
-		return PTR_ERR(filename);
+from pathlib import Path
+import os
 
-#ifdef CONFIG_KSU
-	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
-	ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: execveat (appels manuels insérés)")
-with open('fs/exec.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_execveat.py
-fi
+candidates = ["drivers/kernelsu/policy/app_profile.c", "KernelSU/kernel/policy/app_profile.c"]
+path = None
+for c in candidates:
+    if os.path.exists(c):
+        path = Path(c)
+        break
 
-# --- setresuid ---
-if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
-  cat > /tmp/hook_setresuid.py << 'PYEOF'
-import re
-with open('kernel/sys.c', 'r') as f: content = f.read()
-if 'ksu_handle_setresuid' not in content:
-    extern_decl = '''
-#ifdef CONFIG_KSU
-extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
-#endif
-'''
-    match = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if match: content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
-    hook_code = '''#ifdef CONFIG_KSU
-	(void)ksu_handle_setresuid(ruid, euid, suid);
-#endif
-'''
-    markers = ['\tbool ruid_new, euid_new, suid_new;', '\tkuid_t kruid, keuid, ksuid;']
-    inserted = False
-    for marker in markers:
-        if marker in content:
-            content = content.replace(marker, marker + '\n' + hook_code, 1)
-            inserted = True
-            print("OK: setresuid (inséré après '" + marker.strip()[:50] + "')")
+if path is None:
+    print("⚠️  app_profile.c introuvable, skip")
+    exit(0)
+
+content = path.read_text()
+if 'CONFIG_KSU_SECCOMP_SAFE' in content:
+    print("[i] déjà patché")
+    exit(0)
+
+pattern = r'(void\s+disable_seccomp\s*\(void\)\s*\{)'
+match = re.search(pattern, content)
+if not match:
+    print("[i] disable_seccomp() absente")
+    exit(0)
+
+start_brace = match.end() - 1
+depth = 1
+i = start_brace + 1
+end_brace = -1
+while i < len(content) and depth > 0:
+    if content[i] == '{': depth += 1
+    elif content[i] == '}':
+        depth -= 1
+        if depth == 0:
+            end_brace = i
             break
-    if not inserted:
-        print("❌ setresuid: marqueur introuvable")
-        for line in content.split('\n'):
-            if 'ksuid' in line or 'ruid_new' in line: print("   >", line.strip()[:120])
-        exit(1)
-with open('kernel/sys.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_setresuid.py
-fi
+    i += 1
 
-# --- sys_read ---
-if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
-  cat > /tmp/hook_sys_read.py << 'PYEOF'
-import re
-with open('fs/read_write.c', 'r') as f: content = f.read()
-if 'ksu_handle_sys_read' not in content:
-    extern_decl = '''
-#ifdef CONFIG_KSU
-extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
-#endif
-'''
-    match = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if match: content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
-    old_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-{'''
-    new_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-{
-#ifdef CONFIG_KSU
-	ksu_handle_sys_read(fd, &buf, &count);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: sys_read")
-with open('fs/read_write.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_sys_read.py
-fi
+if end_brace < 0:
+    print("[!] Fermeture non trouvée")
+    exit(1)
 
-# --- input_event ---
-if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
-  cat > /tmp/hook_input.py << 'PYEOF'
-import re
-with open('drivers/input/input.c', 'r') as f: content = f.read()
-if 'ksu_handle_input_handle_event' not in content:
-    extern_decl = '''
-#ifdef CONFIG_KSU
-extern int ksu_handle_input_handle_event(
-			unsigned int *type, unsigned int *code, int *value);
-#endif
-'''
-    match = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if match: content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
-    old_code = '''void input_event(struct input_dev *dev,
-		 unsigned int type, unsigned int code, int value)
-{
-	unsigned long flags;
+body = content[start_brace+1:end_brace]
+new_body = '\n#ifdef CONFIG_SECCOMP\n' + body + '\n#else\n\t/* CONFIG_KSU_SECCOMP_SAFE */\n\treturn;\n#endif\n'
+content = content[:start_brace+1] + new_body + content[end_brace:]
+path.write_text(content)
+print("[+] disable_seccomp() patchée")
+PYEOF_SECCOMP_FIX
 
-	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    new_code = '''void input_event(struct input_dev *dev,
-		 unsigned int type, unsigned int code, int value)
-{
-	unsigned long flags;
-
-#ifdef CONFIG_KSU
-	ksu_handle_input_handle_event(&type, &code, &value);
-#endif
-
-	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: input_event")
-with open('drivers/input/input.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_input.py
-fi
-
-# ==================== 6. VÉRIFICATION FINALE ====================
-echo ""
-echo "=== Vérification finale des hooks ==="
-HOOKS_OK=1
-check_hook() {
-    local fn="$1"; local file="$2"
-    if grep -q "$fn" "$file" 2>/dev/null; then echo "  ✅ $fn présent dans $file"
-    else echo "  ❌ $fn MANQUANT dans $file"; HOOKS_OK=0; fi
-}
-check_hook "ksu_handle_execveat"          "fs/exec.c"
-check_hook "ksu_handle_setresuid"         "kernel/sys.c"
-check_hook "ksu_handle_sys_read"          "fs/read_write.c"
-check_hook "ksu_handle_input_handle_event" "drivers/input/input.c"
-if [ "$HOOKS_OK" -eq 0 ]; then echo "❌ ERREUR CRITIQUE : Des hooks sont manquants."; exit 1; fi
-echo "✅ Tous les hooks sont en place"
-
-# ==================== 7. CONFIGURATION ====================
+# ==================== 5. CONFIGURATION ====================
 echo "=== Configuration ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
@@ -304,7 +185,7 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 {
   echo "CONFIG_KSU=y"
-  echo "CONFIG_KSU_MANUAL_HOOK=y"
+  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
   echo "# CONFIG_KPROBES is not set"
   echo "CONFIG_COMPAT=y"
@@ -320,26 +201,16 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
 
-echo "=== Forçage de CONFIG_KSU_MANUAL_HOOK et désactivation KPROBES ==="
-if grep -q "# CONFIG_KSU_MANUAL_HOOK is not set" out/.config; then
-    sed -i 's/# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
-fi
-if ! grep -q "CONFIG_KSU_MANUAL_HOOK" out/.config; then
-    echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
-fi
-if grep -q "^CONFIG_KPROBES=y" out/.config; then
-    sed -i 's/^CONFIG_KPROBES=y/# CONFIG_KPROBES is not set/' out/.config
-fi
 echo "=== État final .config ==="
-grep -E "KSU_MANUAL_HOOK|KPROBES|KSU_SUSFS" out/.config || true
+grep -E "KSU_MANUAL_HOOK|KSU_TRACEPOINT|KPROBES|KSU_SUSFS" out/.config || true
 
-# ==================== 8. COMPILATION ====================
+# ==================== 6. COMPILATION ====================
 echo "=== Compilation finale ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
 if [ -f "out/arch/arm64/boot/Image" ]; then echo "✅ Compilation réussie"; ls -lh out/arch/arm64/boot/
 else echo "❌ BUILD FAILED"; grep -iE "error:|fatal error:" build.log | head -30; exit 1; fi
 
-# ==================== 9. KSUD ====================
+# ==================== 7. KSUD ====================
 echo "=== Compilation de ksud ==="
 cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -372,15 +243,14 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 10. REPACK ====================
+# ==================== 8. REPACK ====================
 echo "=== Téléchargement des images stock ==="
-echo "→ boot.img..."
 rm -f boot-stock.img
 if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"; fi
-if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then echo "❌ boot-stock.img manquant ou trop petit"; exit 1; fi
-echo "→ dtbo.img..."
+if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then echo "❌ boot-stock.img invalide"; exit 1; fi
 rm -f dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 || true
+
 echo "=== Repack avec magiskboot ==="
 mkdir -p repack; cp boot-stock.img repack/boot.img
 wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O Magisk-v27.0.apk
@@ -398,10 +268,10 @@ rm -f local_su_binary
 mv new-boot.img ../final_boot.img
 cd ..
 
-# ==================== 11. SORTIE ====================
+# ==================== 9. SORTIE ====================
 echo "=== Copie vers output ==="
 mkdir -p output
-cp final_boot.img output/BakaSU-SuSFS-boot.img 2>/dev/null || true
+cp final_boot.img output/BakaSU-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
