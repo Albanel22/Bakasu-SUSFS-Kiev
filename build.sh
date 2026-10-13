@@ -28,24 +28,17 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. BakaSU (drivers/kernelsu) ====================
-echo "=== Intégration BakaSU dans drivers/kernelsu ==="
+# ==================== 2. BakaSU ====================
+echo "=== Intégration BakaSU ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
-mkdir -p drivers/kernelsu
-git clone https://github.com/Baka-SU/BakaSU.git drivers/kernelsu
-
-# Liaison au système de compilation du noyau si nécessaire
-if [ -f "drivers/Kconfig" ] && ! grep -q "kernelsu" drivers/Kconfig; then
-    sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig || true
-fi
-if [ -f "drivers/Makefile" ] && ! grep -q "kernelsu" drivers/Makefile; then
-    echo 'obj-y += kernelsu/' >> drivers/Makefile
-fi
+curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
 if [ -d "drivers/kernelsu" ]; then
     KSU_DIR="drivers/kernelsu"
+elif [ -d "KernelSU" ]; then
+    KSU_DIR="KernelSU"
 else
-    echo "❌ KernelSU introuvable dans drivers/kernelsu"; exit 1
+    echo "❌ KernelSU introuvable"; exit 1
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
