@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+
 # =============================================================================
 # BRANCHE TEST-MANUAL-HOOK-V2 : 8 hooks complets, mode manual pur
 # Objectif : lancer ksud via init.rc injection (comme l'ancien ReSukiSU)
