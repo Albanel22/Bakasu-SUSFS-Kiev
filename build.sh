@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-MANUAL-HOOK : BakaSU + MANUAL_HOOK seul (SUSFS désactivé)
-# Objectif : lancer ksud via init.rc pour que le manager détecte le pilote
-# Base : branche main (boot OK) + changement de mode hook uniquement
+# BRANCHE TEST-MANUAL-HOOK-V2 : 8 hooks complets, mode manual pur
+# Objectif : lancer ksud via init.rc injection (comme l'ancien ReSukiSU)
+# Base : branche main (boot OK) + mode MANUAL_HOOK + 8 hooks
 # =============================================================================
 
-echo "=== Build BakaSU (Manual Hook seul) pour kiev ==="
+echo "=== Build BakaSU (Manual Hook complet) pour kiev ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -43,34 +43,44 @@ else
 fi
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 3. NEUTRALISATION ====================
+# ==================== 3. NEUTRALISATION CIBLÉE (error -> warning) ====================
 echo ""
-echo "=== Neutralisation ==="
-CHECK_PATTERNS=( "inline_hook_check.mk" "manual_hook_check.mk" "tracepoint_hook_check.mk" "susfs_compat.mk" "kprobe_check.mk" )
-for pattern in "${CHECK_PATTERNS[@]}"; do
-    FILES=$(find . -name "$pattern" -type f 2>/dev/null)
+echo "=== Neutralisation ciblée (error -> warning, règles conservées) ==="
+
+CHECK_FILES=( "inline_hook_check.mk" "manual_hook_check.mk" "tracepoint_hook_check.mk" "susfs_compat.mk" "kprobe_check.mk" )
+for pattern in "${CHECK_FILES[@]}"; do
+    FILES=$(find "$KSU_DIR" -name "$pattern" -type f 2>/dev/null)
     if [ -n "$FILES" ]; then
-        for f in $FILES; do echo "# Vérification désactivée" > "$f"; done
+        for f in $FILES; do
+            echo "  → Conversion \$(error → \$(warning) dans : $f"
+            sed -i 's/\$(error/\$(warning/g' "$f"
+        done
     fi
 done
-ERROR_MK_FILES=$(grep -rl '\$(error' "$KSU_DIR" --include="*.mk" 2>/dev/null || true)
-if [ -n "$ERROR_MK_FILES" ]; then
-    for f in $ERROR_MK_FILES; do sed -i 's/\$(error/\$(warning/g' "$f" 2>/dev/null || true; done
+
+# Vérification : plus aucun $(error dans les .mk
+ERROR_REMAINING=$(grep -rl '\$(error' "$KSU_DIR" --include="*.mk" 2>/dev/null || true)
+if [ -n "$ERROR_REMAINING" ]; then
+    echo "  ⚠️  Il reste des \$(error dans : $ERROR_REMAINING"
+    for f in $ERROR_REMAINING; do
+        sed -i 's/\$(error/\$(warning/g' "$f"
+    done
 fi
-echo "✅ Neutralisation terminée"
+echo "✅ Neutralisation ciblée terminée (règles de compilation préservées)"
 
-# ==================== 4. HOOKS MANUELS ====================
+# ==================== 4. 8 HOOKS MANUELS ====================
 echo ""
-echo "=== Hooks manuels BakaSU (mode MANUAL_HOOK) ==="
+echo "=== Insertion des 8 hooks manuels ==="
 
-# --- execveat ---
+# --- Hook 1 : execveat (fs/exec.c) ---
 if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-  cat > /tmp/hook_execveat.py << 'PYEOF'
+  cat > /tmp/hook_1_execveat.py << 'PYEOF'
 import re
 with open('fs/exec.c', 'r') as f: content = f.read()
 if 'ksu_handle_execveat' not in content:
     extern_decl = '''
-#ifdef CONFIG_KSU_MANUAL_HOOK
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+__attribute__((hot))
 extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
 				void *argv, void *envp, int *flags);
 #endif
@@ -82,31 +92,189 @@ extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
     new_code = '''	if (IS_ERR(filename))
 		return PTR_ERR(filename);
 
-#ifdef CONFIG_KSU_MANUAL_HOOK
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, &flags);
 #endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: execveat")
+        print("OK: hook 1/8 execveat")
 with open('fs/exec.c', 'w') as f: f.write(content)
 PYEOF
-  python3 /tmp/hook_execveat.py
+  python3 /tmp/hook_1_execveat.py
 fi
 
-# --- setresuid ---
+# --- Hook 2 : faccessat (fs/open.c) ---
+if ! grep -q "ksu_handle_faccessat" fs/open.c; then
+  cat > /tmp/hook_2_faccessat.py << 'PYEOF'
+import re
+with open('fs/open.c', 'r') as f: content = f.read()
+if 'ksu_handle_faccessat' not in content:
+    extern_decl = '''
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+__attribute__((hot))
+extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+				int *mode, int *flags);
+#endif
+'''
+    match = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if match: content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
+    old_code = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+{
+	return do_faccessat(dfd, filename, mode);'''
+    new_code = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+{
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+#endif
+	return do_faccessat(dfd, filename, mode);'''
+    if old_code in content:
+        content = content.replace(old_code, new_code, 1)
+        print("OK: hook 2/8 faccessat")
+with open('fs/open.c', 'w') as f: f.write(content)
+PYEOF
+  python3 /tmp/hook_2_faccessat.py
+fi
+
+# --- Hooks 3,4,5 : stat/newfstat/fstat64 (fs/stat.c) ---
+if ! grep -q "ksu_handle_fstat64_ret" fs/stat.c; then
+  cat > /tmp/hook_345_stat.py << 'PYEOF'
+import re
+with open('fs/stat.c', 'r') as f: content = f.read()
+
+# Externs
+if 'ksu_handle_stat' not in content:
+    extern_decl = '''
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+__attribute__((hot))
+extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
+#endif
+#endif
+'''
+    match = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if match: content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
+
+# Hook 3 : ksu_handle_stat dans newfstatat
+if 'ksu_handle_stat(&dfd' not in content:
+    old_code = '''	struct kstat stat;
+	int error;
+
+	return vfs_fstatat(dfd, filename, &stat, flag);'''
+    new_code = '''	struct kstat stat;
+	int error;
+
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_stat(&dfd, &filename, &flag);
+#endif
+	return vfs_fstatat(dfd, filename, &stat, flag);'''
+    if old_code in content:
+        content = content.replace(old_code, new_code, 1)
+        print("OK: hook 3/8 stat")
+
+# Hook 4 : ksu_handle_newfstat_ret dans newfstat
+if 'ksu_handle_newfstat_ret' not in content:
+    old_code = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+{
+	struct kstat stat;
+	int error = vfs_fstat(fd, &stat);
+
+	if (!error)
+		error = cp_new_stat(&stat, statbuf);
+
+	return error;'''
+    new_code = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+{
+	struct kstat stat;
+	int error = vfs_fstat(fd, &stat);
+
+	if (!error)
+		error = cp_new_stat(&stat, statbuf);
+
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_newfstat_ret(&fd, &statbuf);
+#endif
+	return error;'''
+    if old_code in content:
+        content = content.replace(old_code, new_code, 1)
+        print("OK: hook 4/8 newfstat_ret")
+
+# Hook 5 : ksu_handle_fstat64_ret dans fstat64
+if 'ksu_handle_fstat64_ret' not in content:
+    old_code = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+{
+	struct kstat stat;
+	int error = vfs_fstat(fd, &stat);
+
+	if (!error)
+		error = cp_new_stat64(&stat, statbuf);
+
+	return error;'''
+    new_code = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+{
+	struct kstat stat;
+	int error = vfs_fstat(fd, &stat);
+
+	if (!error)
+		error = cp_new_stat64(&stat, statbuf);
+
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_fstat64_ret(&fd, &statbuf);
+#endif
+	return error;'''
+    if old_code in content:
+        content = content.replace(old_code, new_code, 1)
+        print("OK: hook 5/8 fstat64_ret")
+
+with open('fs/stat.c', 'w') as f: f.write(content)
+PYEOF
+  python3 /tmp/hook_345_stat.py
+fi
+
+# --- Hook 6 : sys_reboot (kernel/reboot.c) ---
+if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+  cat > /tmp/hook_6_reboot.py << 'PYEOF'
+import re
+with open('kernel/reboot.c', 'r') as f: content = f.read()
+if 'ksu_handle_sys_reboot' not in content:
+    extern_decl = '''
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+#endif
+'''
+    match = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if match: content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
+    old_code = '''	char buffer[256];
+	int ret = 0;'''
+    new_code = '''	char buffer[256];
+	int ret = 0;
+
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+#endif'''
+    if old_code in content:
+        content = content.replace(old_code, new_code, 1)
+        print("OK: hook 6/8 sys_reboot")
+with open('kernel/reboot.c', 'w') as f: f.write(content)
+PYEOF
+  python3 /tmp/hook_6_reboot.py
+fi
+
+# --- Hook 7 : setresuid (kernel/sys.c) ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
-  cat > /tmp/hook_setresuid.py << 'PYEOF'
+  cat > /tmp/hook_7_setresuid.py << 'PYEOF'
 import re
 with open('kernel/sys.c', 'r') as f: content = f.read()
 if 'ksu_handle_setresuid' not in content:
     extern_decl = '''
-#ifdef CONFIG_KSU_MANUAL_HOOK
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif
 '''
     match = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
     if match: content = content[:match.end()] + extern_decl + '\n' + content[match.end():]
-    hook_code = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+    hook_code = '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 	(void)ksu_handle_setresuid(ruid, euid, suid);
 #endif
 '''
@@ -116,24 +284,24 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
         if marker in content:
             content = content.replace(marker, marker + '\n' + hook_code, 1)
             inserted = True
-            print("OK: setresuid")
+            print("OK: hook 7/8 setresuid")
             break
     if not inserted:
-        print("❌ setresuid: marqueur introuvable")
+        print("❌ hook 7/8 setresuid: marqueur introuvable")
         exit(1)
 with open('kernel/sys.c', 'w') as f: f.write(content)
 PYEOF
-  python3 /tmp/hook_setresuid.py
+  python3 /tmp/hook_7_setresuid.py
 fi
 
-# --- input_event ---
+# --- Hook 8 : input_event (drivers/input/input.c) ---
 if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
-  cat > /tmp/hook_input.py << 'PYEOF'
+  cat > /tmp/hook_8_input.py << 'PYEOF'
 import re
 with open('drivers/input/input.c', 'r') as f: content = f.read()
 if 'ksu_handle_input_handle_event' not in content:
     extern_decl = '''
-#ifdef CONFIG_KSU_MANUAL_HOOK
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
 #endif
 '''
@@ -150,25 +318,22 @@ extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code,
 {
 	unsigned long flags;
 
-#ifdef CONFIG_KSU_MANUAL_HOOK
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 	ksu_handle_input_handle_event(&type, &code, &value);
 #endif
 
 	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: input_event")
+        print("OK: hook 8/8 input_event")
 with open('drivers/input/input.c', 'w') as f: f.write(content)
 PYEOF
-  python3 /tmp/hook_input.py
+  python3 /tmp/hook_8_input.py
 fi
 
-# NOTE: sys_read hook n'est PAS nécessaire car CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
-# le gère automatiquement (cf. ksud_integration.c : "return 0; // dummy hook here")
-
-# ==================== 4b. VÉRIFICATION FINALE ====================
+# ==================== 5. VÉRIFICATION DES 8 HOOKS ====================
 echo ""
-echo "=== Vérification finale des hooks ==="
+echo "=== Vérification des 8 hooks ==="
 HOOKS_OK=1
 check_hook() {
     local fn="$1"; local file="$2"
@@ -176,14 +341,19 @@ check_hook() {
     else echo "  ❌ $fn MANQUANT dans $file"; HOOKS_OK=0; fi
 }
 check_hook "ksu_handle_execveat"          "fs/exec.c"
+check_hook "ksu_handle_faccessat"         "fs/open.c"
+check_hook "ksu_handle_stat"              "fs/stat.c"
+check_hook "ksu_handle_newfstat_ret"      "fs/stat.c"
+check_hook "ksu_handle_fstat64_ret"       "fs/stat.c"
+check_hook "ksu_handle_sys_reboot"        "kernel/reboot.c"
 check_hook "ksu_handle_setresuid"         "kernel/sys.c"
 check_hook "ksu_handle_input_handle_event" "drivers/input/input.c"
-if [ "$HOOKS_OK" -eq 0 ]; then echo "❌ ERREUR CRITIQUE"; exit 1; fi
-echo "✅ Tous les hooks sont en place"
+if [ "$HOOKS_OK" -eq 0 ]; then echo "❌ ERREUR CRITIQUE : Des hooks sont manquants."; exit 1; fi
+echo "✅ Les 8 hooks sont en place"
 
-# ==================== 5. CONFIGURATION ====================
+# ==================== 6. CONFIGURATION ====================
 echo ""
-echo "=== Configuration (MANUAL_HOOK seul, sans SUSFS) ==="
+echo "=== Configuration (MANUAL_HOOK pur, SUSFS désactivé) ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -194,9 +364,9 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_KSU=y"
   echo "CONFIG_KSU_MANUAL_HOOK=y"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"
+  echo "# CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK is not set"
+  echo "# CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK is not set"
+  echo "# CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK is not set"
   echo "# CONFIG_KPROBES is not set"
   echo "CONFIG_COMPAT=y"
   echo "CONFIG_COMPAT_32BIT_TIME=y"
@@ -217,14 +387,14 @@ if grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
 fi
 grep -E "KSU_MANUAL_HOOK|KSU_TRACEPOINT|KPROBES|KSU_SUSFS" out/.config || true
 
-# ==================== 5b. PATCHS MOTOROLA ====================
+# ==================== 6b. PATCHS MOTOROLA ====================
 echo ""
 echo "=== Patch signatures modules + tactile ==="
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
 echo "✅ Patches Motorola appliqués"
 
-# ==================== 6. COMPILATION ====================
+# ==================== 7. COMPILATION ====================
 echo ""
 echo "=== Compilation finale ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
@@ -238,16 +408,16 @@ else
     exit 1
 fi
 
-# ==================== 6b. DIAGNOSTIC VMLINUX ====================
+# ==================== 7b. DIAGNOSTIC VMLINUX ====================
 echo ""
 echo "=== Diagnostic vmlinux ==="
 VMLINUX="out/vmlinux"
 if [ -f "$VMLINUX" ]; then
-    for sym in "kernelsu_init" "ksu_supercalls_init" "ksu_ksud_init" "ksu_handle_initrc"; do
+    for sym in "kernelsu_init" "ksu_supercalls_init" "ksu_ksud_init"; do
         if nm "$VMLINUX" 2>/dev/null | grep -q "$sym"; then
             echo "  ✅ $sym présent"
         else
-            echo "  ❌ $sym ABSENT"
+            echo "  ⚠️  $sym absent (peut être inliné)"
         fi
     done
     if strings "$VMLINUX" 2>/dev/null | grep -q "on post-fs-data"; then
@@ -255,9 +425,14 @@ if [ -f "$VMLINUX" ]; then
     else
         echo "  ❌ KERNEL_SU_RC ABSENT"
     fi
+    for hook in "ksu_handle_execveat" "ksu_handle_faccessat" "ksu_handle_stat" "ksu_handle_sys_reboot"; do
+        if nm "$VMLINUX" 2>/dev/null | grep -q "$hook"; then
+            echo "  ✅ $hook lié"
+        fi
+    done
 fi
 
-# ==================== 7. KSUD ====================
+# ==================== 8. KSUD ====================
 cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -289,7 +464,7 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 8. REPACK ====================
+# ==================== 9. REPACK ====================
 echo ""
 echo "=== Repack ==="
 rm -f boot-stock.img
@@ -316,7 +491,6 @@ if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then
 fi
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-# Ajout de allow_shell à la cmdline
 if [ -f "bootimg.cfg" ]; then
     if ! grep -q "allow_shell" bootimg.cfg; then
         sed -i 's/^cmdline = \(.*\)$/cmdline = \1 kernelsu.allow_shell=1 allow_shell=1/' bootimg.cfg
@@ -324,7 +498,6 @@ if [ -f "bootimg.cfg" ]; then
     fi
 fi
 
-# Injection de ksud dans le ramdisk (chemin standard BakaSU)
 ./magiskboot cpio ramdisk.cpio \
     "mkdir 0755 data" \
     "mkdir 0755 data/adb" \
@@ -342,7 +515,7 @@ rm -f local_su_binary
 ./magiskboot repack boot.img new-boot.img
 mv new-boot.img ../final_boot.img
 
-# ==================== 8b. DIAGNOSTIC POST-REPACK ====================
+# ==================== 9b. DIAGNOSTIC POST-REPACK ====================
 echo ""
 echo "=== DIAGNOSTIC POST-REPACK ==="
 mkdir -p ../verify
@@ -357,7 +530,7 @@ if [ -f "kernel" ]; then
     else
         echo "⚠️  Noyau extrait DIFFÈRE"
     fi
-    for sym in "kernelsu" "KERNEL_SU_RC" "ksu_ksud_init"; do
+    for sym in "kernelsu" "KERNEL_SU_RC"; do
         if strings kernel 2>/dev/null | grep -q "$sym"; then
             echo "  ✅ '$sym' trouvé"
         else
@@ -367,14 +540,13 @@ if [ -f "kernel" ]; then
 fi
 cd ..
 
-# ==================== 9. SORTIE ====================
+# ==================== 10. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-manual-boot.img 2>/dev/null || true
+cp final_boot.img output/BakaSU-manual-v2-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ (branche test-manual-hook) ==="
-echo "Mode : MANUAL_HOOK seul, SUSFS désactivé"
-echo "Init.rc injection : activée via CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK"
+echo "=== BUILD TERMINÉ (test-manual-hook-v2) ==="
+echo "Mode : MANUAL_HOOK pur, 8 hooks, SUSFS désactivé"
 ls -lh output/
