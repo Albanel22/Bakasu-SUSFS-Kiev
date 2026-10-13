@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # =============================================================================
-# BUILD FINAL : LineageOS 23.2 + BakaSU (SuSFS Inline) + patchs Motorola
+# BUILD FINAL : LineageOS 23.2 + BakaSU (SuSFS Inline) + patches Motorola
 # Appareil : Motorola One 5G Ace (kiev / SM8250)
+# MODIF : allow_shell=1 dans la cmdline + diagnostic post-repack
 # =============================================================================
 
 echo "=== Build BakaSU (SuSFS Inline) + patches Motorola pour kiev ==="
@@ -227,7 +228,7 @@ grep -E "KSU_MANUAL_HOOK|KSU_TRACEPOINT|KPROBES|KSU_SUSFS" out/.config || true
 
 # ==================== 5b. PATCHS MOTOROLA ====================
 echo ""
-echo "=== Patch signatures modules + tactile (APRÈS olddefconfig) ==="
+echo "=== Patch signatures modules + tactile ==="
 
 echo "Patch signatures modules..."
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
@@ -241,8 +242,17 @@ echo "✅ Patches Motorola appliqués"
 echo ""
 echo "=== Compilation finale ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
-if [ -f "out/arch/arm64/boot/Image" ]; then echo "✅ Compilation réussie"; ls -lh out/arch/arm64/boot/
-else echo "❌ BUILD FAILED"; grep -iE "error:|fatal error:" build.log | head -30; exit 1; fi
+if [ -f "out/arch/arm64/boot/Image" ]; then
+    echo "✅ Compilation réussie"
+    ls -lh out/arch/arm64/boot/
+    # Sauvegarder le hash du noyau compilé pour comparaison post-repack
+    sha256sum out/arch/arm64/boot/Image | cut -d' ' -f1 > /tmp/kernel_compiled_hash.txt
+    echo "→ Hash noyau compilé : $(cat /tmp/kernel_compiled_hash.txt)"
+else
+    echo "❌ BUILD FAILED"
+    grep -iE "error:|fatal error:" build.log | head -30
+    exit 1
+fi
 
 # ==================== 7. KSUD ====================
 cd "$GITHUB_WORKSPACE"
@@ -276,28 +286,112 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 8. REPACK ====================
-echo "=== Repack ==="
+# ==================== 8. REPACK AVEC allow_shell + DIAGNOSTIC ====================
+echo ""
+echo "=== Repack avec modification cmdline (allow_shell) ==="
+
 rm -f boot-stock.img
-if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"; fi
-if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then echo "❌ boot-stock.img invalide"; exit 1; fi
+if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
+    echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"
+fi
+if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
+    echo "❌ boot-stock.img invalide"; exit 1
+fi
 rm -f dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 || true
 
-mkdir -p repack; cp boot-stock.img repack/boot.img
+mkdir -p repack
+cp boot-stock.img repack/boot.img
 wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O Magisk-v27.0.apk
 unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so
-mv lib/x86_64/libmagiskboot.so repack/magiskboot; chmod +x repack/magiskboot; rm -rf Magisk-v27.0.apk lib/
+mv lib/x86_64/libmagiskboot.so repack/magiskboot
+chmod +x repack/magiskboot
+rm -rf Magisk-v27.0.apk lib/
 cd repack
+
 ./magiskboot unpack boot.img
-if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then echo "❌ Échec unpack"; exit 1; fi
+if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then
+    echo "❌ Échec unpack"; exit 1
+fi
+
+# Diagnostic : format de compression du noyau original
+echo ""
+echo "→ Format du noyau original :"
+file kernel 2>/dev/null || true
+head -c 4 kernel | xxd | head -1
+
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
-./magiskboot cpio ramdisk.cpio "mkdir 0755 data" "mkdir 0755 data/adb" "mkdir 0755 data/adb/ksud" "add 0755 data/adb/ksud/ksud $GITHUB_WORKSPACE/ksud"
-cp "$GITHUB_WORKSPACE/ksud" local_su_binary; chmod 755 local_su_binary
-./magiskboot cpio ramdisk.cpio "mkdir 0755 system" "mkdir 0755 system/bin" "add 06755 system/bin/su ./local_su_binary"
+
+# Ajout des paramètres allow_shell à la cmdline
+echo "→ Ajout de allow_shell=1 à la cmdline"
+CMDLINE_MODIFIED=0
+if [ -f "bootimg.cfg" ]; then
+    if ! grep -q "allow_shell" bootimg.cfg; then
+        sed -i 's/^cmdline = \(.*\)$/cmdline = \1 kernelsu.allow_shell=1 allow_shell=1/' bootimg.cfg
+        CMDLINE_MODIFIED=1
+        echo "  ✅ bootimg.cfg modifié :"
+        grep "^cmdline" bootimg.cfg
+    else
+        echo "  [i] allow_shell déjà présent"
+    fi
+else
+    echo "  ⚠️ bootimg.cfg absent"
+fi
+
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 data" \
+    "mkdir 0755 data/adb" \
+    "mkdir 0755 data/adb/ksud" \
+    "add 0755 data/adb/ksud/ksud $GITHUB_WORKSPACE/ksud"
+
+cp "$GITHUB_WORKSPACE/ksud" local_su_binary
+chmod 755 local_su_binary
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 system" \
+    "mkdir 0755 system/bin" \
+    "add 06755 system/bin/su ./local_su_binary"
 rm -f local_su_binary
+
 ./magiskboot repack boot.img new-boot.img
 mv new-boot.img ../final_boot.img
+
+# ==================== 8b. DIAGNOSTIC POST-REPACK ====================
+echo ""
+echo "=== DIAGNOSTIC POST-REPACK ==="
+
+mkdir -p ../verify
+cd ../verify
+cp ../final_boot.img verify_boot.img
+../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
+
+if [ -f "kernel" ]; then
+    echo "→ Taille du noyau extrait : $(du -h kernel | cut -f1)"
+    echo "→ Taille du noyau compilé : $(du -h "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" | cut -f1)"
+
+    HASH_EXTRACTED=$(sha256sum kernel | cut -d' ' -f1)
+    HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
+
+    echo "→ Hash extrait : $HASH_EXTRACTED"
+    echo "→ Hash compilé : $HASH_COMPILED"
+
+    if [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ]; then
+        echo "✅ Le noyau extrait est IDENTIQUE au noyau compilé"
+    else
+        echo "⚠️  Le noyau extrait DIFFÈRE du noyau compilé !"
+    fi
+
+    echo ""
+    echo "→ Recherche des symboles KernelSU/SUSFS dans le noyau extrait :"
+    for sym in "kernelsu" "susfs" "ksu_handle" "susfs_is_current"; do
+        if strings kernel 2>/dev/null | grep -q "$sym"; then
+            echo "  ✅ '$sym' trouvé"
+        else
+            echo "  ❌ '$sym' ABSENT"
+        fi
+    done
+else
+    echo "❌ Impossible d'extraire le noyau de l'image finale"
+fi
 cd ..
 
 # ==================== 9. SORTIE ====================
@@ -308,4 +402,5 @@ cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "=== BUILD TERMINÉ ==="
+echo "Cmdline modifiée : kernelsu.allow_shell=1 allow_shell=1 (si bootimg.cfg présent)"
 ls -lh output/
