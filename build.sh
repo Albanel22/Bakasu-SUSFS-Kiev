@@ -2,13 +2,12 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-ALBANEL-V2 : Nettoyage Unicode + 9 hooks ReSukiSU
+# BRANCHE TEST-ALBANEL-V4 : Static exports SELinux + hooks doc officielle
 # Source : Albanel22/ReSukiSU (fork intact d'août 2026, v4.2.0-rc1)
-# Patch SUSFS : JackA1ltman (celui de l'ancien script)
-# Images : Google Drive (boot.img + dtbo.img du 2026-09-20)
+# Mode : MANUAL_HOOK seul (SUSFS désactivé)
 # =============================================================================
 
-echo "=== Build ReSukiSU (Albanel22) + SusFS pour kiev ==="
+echo "=== Build ReSukiSU (Albanel22) + Static exports SELinux ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -55,7 +54,7 @@ fi
 KSU_DIR="KernelSU"
 echo "KSU_DIR détecté : $KSU_DIR"
 
-# ==================== 2b. NETTOYAGE UNICODE ROBUSTE ====================
+# ==================== 2b. NETTOYAGE UNICODE ====================
 echo ""
 echo "=== Nettoyage Unicode robuste de KernelSU ==="
 
@@ -63,24 +62,10 @@ python3 << 'PYEOF'
 import os
 from pathlib import Path
 
-# Caractères Unicode à remplacer par des espaces ASCII
 UNICODE_SPACES = [
-    '\u00A0',  # Espace insécable
-    '\u2000',  # En quad
-    '\u2001',  # Em quad
-    '\u2002',  # En space
-    '\u2003',  # Em space
-    '\u2004',  # Three-per-em space
-    '\u2005',  # Four-per-em space
-    '\u2006',  # Six-per-em space
-    '\u2007',  # Figure space
-    '\u2008',  # Punctuation space
-    '\u2009',  # Thin space
-    '\u200A',  # Hair space
-    '\u200B',  # Zero-width space
-    '\u202F',  # Narrow no-break space
-    '\u205F',  # Medium mathematical space
-    '\u3000',  # Ideographic space
+    '\u00A0', '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005',
+    '\u2006', '\u2007', '\u2008', '\u2009', '\u200A', '\u200B', '\u202F',
+    '\u205F', '\u3000',
 ]
 
 count_files = 0
@@ -106,7 +91,6 @@ for root, dirs, files in os.walk('KernelSU'):
 print(f"✅ {count_files} fichiers nettoyés, {count_fixes} remplacements effectués")
 PYEOF
 
-# Vérification post-nettoyage
 echo ""
 echo "=== Vérification post-nettoyage ==="
 UNICODE_REMAINING=$(grep -rlP '[\x{00A0}\x{2000}-\x{200B}\x{202F}\x{205F}\x{3000}]' "$KSU_DIR" --include="*.c" --include="*.h" 2>/dev/null || true)
@@ -117,36 +101,113 @@ else
     echo "  ✅ Aucun Unicode restant détecté"
 fi
 
-# ==================== 3. HOOKS ReSukiSU (double garde) ====================
+# ==================== 3. STATIC EXPORTS SELINUX ====================
 echo ""
-echo "=== Hooks ReSukiSU avec DOUBLE GARDE (SUSFS || MANUAL_HOOK) ==="
+echo "=== Static exports SELinux (doc officielle ReSukiSU) ==="
+
+# Export 1 : write_op
+if [ -f "security/selinux/selinuxfs.c" ]; then
+    if grep -q "^static ssize_t (\*write_op\[\])" security/selinux/selinuxfs.c; then
+        sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
+        echo "  ✅ write_op exporté"
+    elif grep -q "^static ssize_t (\*write_op\[\])(struct file \*, char \*, size_t)" security/selinux/selinuxfs.c; then
+        sed -i 's/^static ssize_t (\*write_op\[\])(struct file \*, char \*, size_t)/ssize_t (*write_op[])(struct file *, char *, size_t)/' security/selinux/selinuxfs.c
+        echo "  ✅ write_op exporté (variante)"
+    else
+        echo "  ⚠️  write_op non trouvé ou déjà exporté"
+    fi
+fi
+
+# Export 2 : sel_handle_status_ops
+if [ -f "security/selinux/selinuxfs.c" ]; then
+    if grep -q "^static const struct file_operations sel_handle_status_ops" security/selinux/selinuxfs.c; then
+        sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
+        echo "  ✅ sel_handle_status_ops exporté"
+    else
+        echo "  ⚠️  sel_handle_status_ops non trouvé ou déjà exporté"
+    fi
+fi
+
+# Export 3 : selinux_status_page + selinux_status_lock (4.17-)
+if [ -f "security/selinux/ss/status.c" ]; then
+    if grep -q "^static struct page \*selinux_status_page" security/selinux/ss/status.c; then
+        sed -i 's/^static struct page \*selinux_status_page/struct page *selinux_status_page/' security/selinux/ss/status.c
+        echo "  ✅ selinux_status_page exporté"
+    fi
+    if grep -q "^static DEFINE_MUTEX(selinux_status_lock)" security/selinux/ss/status.c; then
+        sed -i 's/^static DEFINE_MUTEX(selinux_status_lock)/DEFINE_MUTEX(selinux_status_lock)/' security/selinux/ss/status.c
+        echo "  ✅ selinux_status_lock exporté"
+    fi
+fi
+
+# Export 4 : policy_rwlock (4.17-)
+if [ -f "security/selinux/ss/services.c" ]; then
+    if grep -q "^static DEFINE_RWLOCK(policy_rwlock)" security/selinux/ss/services.c; then
+        sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
+        echo "  ✅ policy_rwlock exporté"
+    fi
+fi
+
+# Export 5 : sel_mutex (4.17-)
+if [ -f "security/selinux/selinuxfs.c" ]; then
+    if grep -q "^static DEFINE_MUTEX(sel_mutex)" security/selinux/selinuxfs.c; then
+        sed -i 's/^static DEFINE_MUTEX(sel_mutex)/DEFINE_MUTEX(sel_mutex)/' security/selinux/selinuxfs.c
+        echo "  ✅ sel_mutex exporté"
+    fi
+fi
+
+# Export 6 : selinux_ops (4.2-)
+if [ -f "security/selinux/hooks.c" ]; then
+    if grep -q "^static struct security_operations selinux_ops" security/selinux/hooks.c; then
+        sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
+        echo "  ✅ selinux_ops exporté"
+    fi
+fi
+
+# Export 7 : security_dump_masked_av + context_struct_compute_av (6.6+)
+if [ -f "security/selinux/ss/services.c" ]; then
+    if grep -q "^static void security_dump_masked_av" security/selinux/ss/services.c; then
+        sed -i 's/^static void security_dump_masked_av/void security_dump_masked_av/' security/selinux/ss/services.c
+        echo "  ✅ security_dump_masked_av exporté"
+    fi
+    if grep -q "^static void context_struct_compute_av" security/selinux/ss/services.c; then
+        sed -i 's/^static void context_struct_compute_av/void context_struct_compute_av/' security/selinux/ss/services.c
+        echo "  ✅ context_struct_compute_av exporté"
+    fi
+fi
+
+echo "✅ Static exports SELinux terminés"
+
+# ==================== 4. HOOKS MANUELS (doc officielle) ====================
+echo ""
+echo "=== Hooks manuels (patterns doc officielle ReSukiSU) ==="
 
 # --- Hook 1 : execveat (fs/exec.c) ---
-if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+if ! grep -q "ksu_handle_execveat(" fs/exec.c; then
   cat > /tmp/h_execveat.py << 'PYEOF'
 import re
 with open('fs/exec.c', 'r') as f: content = f.read()
-if 'ksu_handle_execveat' not in content:
+if 'ksu_handle_execveat(&' not in content and 'ksu_handle_execveat((' not in content:
     extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+#ifdef CONFIG_KSU_MANUAL_HOOK
 __attribute__((hot))
 extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
 				void *argv, void *envp, int *flags);
 #endif
 '''
-    pattern = r'(static int do_execveat_common\()'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''	struct user_arg_ptr argv = { .ptr.native = __argv };
-	struct user_arg_ptr envp = { .ptr.native = __envp };
-	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
-    new_code = '''	struct user_arg_ptr argv = { .ptr.native = __argv };
-	struct user_arg_ptr envp = { .ptr.native = __envp };
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-#endif
-	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m and 'extern int ksu_handle_execveat' not in content:
+        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
+    old = '''	if (IS_ERR(filename))
+		return PTR_ERR(filename);'''
+    new = '''	if (IS_ERR(filename))
+		return PTR_ERR(filename);
+
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, &flags);
+#endif'''
+    if old in content:
+        content = content.replace(old, new, 1)
         print("OK: execveat")
 with open('fs/exec.c', 'w') as f: f.write(content)
 PYEOF
@@ -154,31 +215,32 @@ PYEOF
 fi
 
 # --- Hook 2 : faccessat (fs/open.c) ---
-if ! grep -q "ksu_handle_faccessat" fs/open.c; then
+if ! grep -q "ksu_handle_faccessat(" fs/open.c; then
   cat > /tmp/h_faccessat.py << 'PYEOF'
 import re
 with open('fs/open.c', 'r') as f: content = f.read()
-if 'ksu_handle_faccessat' not in content:
+if 'ksu_handle_faccessat(&dfd' not in content:
     extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+#ifdef CONFIG_KSU_MANUAL_HOOK
 __attribute__((hot))
 extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
 				int *mode, int *flags);
 #endif
 '''
-    pattern = r'(SYSCALL_DEFINE3\(faccessat)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m and 'extern int ksu_handle_faccessat' not in content:
+        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
+    old = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
 {
 	return do_faccessat(dfd, filename, mode);'''
-    new_code = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+    new = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
 {
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+#ifdef CONFIG_KSU_MANUAL_HOOK
 	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
 #endif
 	return do_faccessat(dfd, filename, mode);'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
+    if old in content:
+        content = content.replace(old, new, 1)
         print("OK: faccessat")
 with open('fs/open.c', 'w') as f: f.write(content)
 PYEOF
@@ -193,7 +255,7 @@ with open('fs/stat.c', 'r') as f: content = f.read()
 
 if 'ksu_handle_stat' not in content:
     extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+#ifdef CONFIG_KSU_MANUAL_HOOK
 __attribute__((hot))
 extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
 extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
@@ -206,32 +268,26 @@ extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **sta
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
 
 if 'ksu_handle_stat(&dfd' not in content:
-    old_code = '''	struct kstat stat;
-	int error;
-
-	return vfs_fstatat(dfd, filename, &stat, flag);'''
-    new_code = '''	struct kstat stat;
-	int error;
-
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	ksu_handle_stat(&dfd, &filename, &flag);
-#endif
-	return vfs_fstatat(dfd, filename, &stat, flag);'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: stat")
-    else:
-        old_code2 = '\terror = vfs_fstatat(dfd, filename, &stat, flag);'
-        new_code2 = '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+    old = '\terror = vfs_fstatat(dfd, filename, &stat, flag);'
+    new = '''#ifdef CONFIG_KSU_MANUAL_HOOK
 	ksu_handle_stat(&dfd, &filename, &flag);
 #endif
 	error = vfs_fstatat(dfd, filename, &stat, flag);'''
-        if old_code2 in content:
-            content = content.replace(old_code2, new_code2, 1)
-            print("OK: stat (kernel 4.19)")
+    if old in content:
+        content = content.replace(old, new, 1)
+        print("OK: stat")
+    else:
+        old2 = '\treturn vfs_fstatat(dfd, filename, &stat, flag);'
+        new2 = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_stat(&dfd, &filename, &flag);
+#endif
+	return vfs_fstatat(dfd, filename, &stat, flag);'''
+        if old2 in content:
+            content = content.replace(old2, new2, 1)
+            print("OK: stat (fallback)")
 
 if 'ksu_handle_newfstat_ret' not in content:
-    old_code = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+    old = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
 {
 	struct kstat stat;
 	int error = vfs_fstat(fd, &stat);
@@ -240,7 +296,7 @@ if 'ksu_handle_newfstat_ret' not in content:
 		error = cp_new_stat(&stat, statbuf);
 
 	return error;'''
-    new_code = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+    new = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
 {
 	struct kstat stat;
 	int error = vfs_fstat(fd, &stat);
@@ -248,16 +304,16 @@ if 'ksu_handle_newfstat_ret' not in content:
 	if (!error)
 		error = cp_new_stat(&stat, statbuf);
 
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+#ifdef CONFIG_KSU_MANUAL_HOOK
 	ksu_handle_newfstat_ret(&fd, &statbuf);
 #endif
 	return error;'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
+    if old in content:
+        content = content.replace(old, new, 1)
         print("OK: newfstat_ret")
 
 if 'ksu_handle_fstat64_ret' not in content:
-    old_code = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+    old = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
 {
 	struct kstat stat;
 	int error = vfs_fstat(fd, &stat);
@@ -266,7 +322,7 @@ if 'ksu_handle_fstat64_ret' not in content:
 		error = cp_new_stat64(&stat, statbuf);
 
 	return error;'''
-    new_code = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+    new = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
 {
 	struct kstat stat;
 	int error = vfs_fstat(fd, &stat);
@@ -274,12 +330,12 @@ if 'ksu_handle_fstat64_ret' not in content:
 	if (!error)
 		error = cp_new_stat64(&stat, statbuf);
 
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+#ifdef CONFIG_KSU_MANUAL_HOOK
 	ksu_handle_fstat64_ret(&fd, &statbuf);
 #endif
 	return error;'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
+    if old in content:
+        content = content.replace(old, new, 1)
         print("OK: fstat64_ret")
 
 with open('fs/stat.c', 'w') as f: f.write(content)
@@ -287,52 +343,54 @@ PYEOF
   python3 /tmp/h_stat.py
 fi
 
-# --- Hook 6 : sys_reboot (kernel/reboot.c) ---
+# --- Hook 6 : sys_reboot ---
 if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
   cat > /tmp/h_reboot.py << 'PYEOF'
 import re
 with open('kernel/reboot.c', 'r') as f: content = f.read()
 if 'ksu_handle_sys_reboot' not in content:
     extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+#ifdef CONFIG_KSU_MANUAL_HOOK
 extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
 #endif
 '''
-    pattern = r'(SYSCALL_DEFINE4\(reboot)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''	char buffer[256];
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m and 'extern int ksu_handle_sys_reboot' not in content:
+        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
+    old = '''	char buffer[256];
 	int ret = 0;'''
-    new_code = '''	char buffer[256];
+    new = '''	char buffer[256];
 	int ret = 0;
 
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+#ifdef CONFIG_KSU_MANUAL_HOOK
 	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
 #endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
+    if old in content:
+        content = content.replace(old, new, 1)
         print("OK: sys_reboot")
 with open('kernel/reboot.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h_reboot.py
 fi
 
-# --- Hook 7 : setresuid (kernel/sys.c) ---
+# --- Hook 7 : setresuid ---
 if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
   cat > /tmp/h_setresuid.py << 'PYEOF'
 import re
 with open('kernel/sys.c', 'r') as f: content = f.read()
 if 'ksu_handle_setresuid' not in content:
     extern_decl = '''
-#ifdef CONFIG_KSU_SUSFS
+#ifdef CONFIG_KSU_MANUAL_HOOK
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif
 '''
-    pattern = r'(long __sys_setresuid)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m and 'extern int ksu_handle_setresuid' not in content:
+        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
     for marker in ['\tbool ruid_new, euid_new, suid_new;', '\tkuid_t kruid, keuid, ksuid;']:
         if marker in content:
             new_code = marker + '''
-#ifdef CONFIG_KSU_SUSFS
+#ifdef CONFIG_KSU_MANUAL_HOOK
 	(void)ksu_handle_setresuid(ruid, euid, suid);
 #endif'''
             content = content.replace(marker, new_code, 1)
@@ -343,137 +401,80 @@ PYEOF
   python3 /tmp/h_setresuid.py
 fi
 
-# --- Hook 8 : sys_read (fs/read_write.c) ---
+# --- Hook 8 : sys_read (géré par AUTO_INITRC_HOOK, mais on l'ajoute en sécurité) ---
 if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
   cat > /tmp/h_read.py << 'PYEOF'
 import re
 with open('fs/read_write.c', 'r') as f: content = f.read()
 if 'ksu_handle_sys_read' not in content:
     extern_decl = '''
-#ifdef CONFIG_KSU
-extern struct static_key_true ksu_is_init_rc_hook_enabled;
-extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern bool ksu_init_rc_hook __read_mostly;
+extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,
+				char __user **buf_ptr, size_t *count_ptr);
 #endif
 '''
-    pattern = r'(SYSCALL_DEFINE3\(read)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''	return ksys_read(fd, buf, count);'''
-    new_code = '''#ifdef CONFIG_KSU
-	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
-		ksu_handle_sys_read(fd);
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m and 'extern bool ksu_init_rc_hook' not in content:
+        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
+    old = '''	return ksys_read(fd, buf, count);'''
+    new = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+	if (unlikely(ksu_init_rc_hook))
+		ksu_handle_sys_read(fd, &buf, &count);
 #endif
 	return ksys_read(fd, buf, count);'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
+    if old in content:
+        content = content.replace(old, new, 1)
         print("OK: sys_read")
 with open('fs/read_write.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h_read.py
 fi
 
-# --- Hook 9 : input_event (drivers/input/input.c) ---
+# --- Hook 9 : input_event ---
 if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
   cat > /tmp/h_input.py << 'PYEOF'
 import re
 with open('drivers/input/input.c', 'r') as f: content = f.read()
 if 'ksu_handle_input_handle_event' not in content:
     extern_decl = '''
-#ifdef CONFIG_KSU
-extern struct static_key_true ksu_is_input_hook_enabled;
-extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern bool ksu_input_hook __read_mostly;
+extern __attribute__((cold)) int ksu_handle_input_handle_event(
+			unsigned int *type, unsigned int *code, int *value);
 #endif
 '''
-    pattern = r'(static void input_handle_event\(struct input_dev \*dev,)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    new_code = '''#ifdef CONFIG_KSU
-	if (static_branch_unlikely(&ksu_is_input_hook_enabled))
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m and 'extern bool ksu_input_hook' not in content:
+        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
+    old = '''void input_event(struct input_dev *dev,
+		 unsigned int type, unsigned int code, int value)
+{
+	unsigned long flags;
+
+	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
+    new = '''void input_event(struct input_dev *dev,
+		 unsigned int type, unsigned int code, int value)
+{
+	unsigned long flags;
+
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	if (unlikely(ksu_input_hook))
 		ksu_handle_input_handle_event(&type, &code, &value);
 #endif
+
 	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
+    if old in content:
+        content = content.replace(old, new, 1)
         print("OK: input_event")
 with open('drivers/input/input.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h_input.py
 fi
 
-# ==================== 4. PATCH SUSFS (JackA1ltman) ====================
+# ==================== 5. CONFIGURATION ====================
 echo ""
-echo "=== Patch SUSFS 4.19 (JackA1ltman) ==="
-cd "$GITHUB_WORKSPACE"
-rm -rf /tmp/jack_repo
-git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git /tmp/jack_repo 2>/dev/null || true
-
-cd "$GITHUB_WORKSPACE/kernel_sources"
-PATCH_419=$(find /tmp/jack_repo/Patches -name "*4.19*" -name "*.patch" 2>/dev/null | head -1)
-if [ -n "$PATCH_419" ]; then
-    echo "→ Application : $PATCH_419"
-    patch -p1 < "$PATCH_419" 2>&1 | tee /tmp/susfs_patch.log || true
-fi
-find . -name "*.rej" -type f -delete 2>/dev/null || true
-echo "✅ Patch SUSFS appliqué"
-
-# ==================== 5. CORRECTIONS POST-PATCH ====================
-echo ""
-echo "=== Corrections post-patch ==="
-
-for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
-    if [ -f "$f" ]; then
-        sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
-    fi
-done
-echo "  ✅ vma __maybe_unused"
-
-if [ -f "fs/namespace.c" ] && ! grep -q "susfs_def.h" fs/namespace.c; then
-    sed -i '/#include <linux\/sched\/task.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n#define CL_COPY_MNT_NS BIT(25)\n#endif' fs/namespace.c
-fi
-
-if [ -f "fs/super.c" ] && ! grep -q "susfs_def.h" fs/super.c; then
-    python3 << 'PYEOF'
-import re
-from pathlib import Path
-p = Path("fs/super.c")
-content = p.read_text()
-if 'susfs_def.h' not in content:
-    decl = '''
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs_def.h>
-#endif
-
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-extern bool susfs_is_current_ksu_domain(void);
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#endif
-'''
-    anchor = '#include "internal.h"'
-    if anchor in content:
-        content = content.replace(anchor, anchor + '\n' + decl, 1)
-        p.write_text(content)
-        print("  ✅ fs/super.c : include susfs_def.h")
-PYEOF
-fi
-
-if [ -f "fs/stat.c" ] && ! grep -q "susfs_def.h" fs/stat.c; then
-    python3 << 'PYEOF'
-from pathlib import Path
-p = Path("fs/stat.c")
-content = p.read_text()
-if 'susfs_def.h' not in content:
-    anchor = '#include <asm/unistd.h>'
-    if anchor in content:
-        content = content.replace(anchor, anchor + '\n\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif', 1)
-        p.write_text(content)
-        print("  ✅ fs/stat.c : include susfs_def.h")
-PYEOF
-fi
-
-echo "  ✅ Corrections post-patch terminées"
-
-# ==================== 6. CONFIGURATION ====================
-echo ""
-echo "=== Configuration (MANUAL_HOOK + AUTO_* + KPROBES + SUSFS) ==="
+echo "=== Configuration (MANUAL_HOOK seul, SUSFS désactivé) ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -493,29 +494,74 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_COMPAT_32BIT_TIME=y"
   echo "# CONFIG_COMPAT_VDSO is not set"
   echo "# CONFIG_VDSO32 is not set"
-  echo "CONFIG_KSU_SUSFS=y"
-  echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-  echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-  echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-  echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+  echo "# CONFIG_KSU_SUSFS is not set"
 } >> out/.config
 
-make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
-grep -E "KSU_MANUAL_HOOK|KPROBES|KSU_SUSFS" out/.config | head -25 || true
+make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
-# ==================== 7. PATCH SIGNATURES + TACTILE ====================
+# ==================== 5b. FORÇAGE MANUAL_HOOK POST-OLDDEFCONFIG ====================
+echo ""
+echo "=== Forçage de CONFIG_KSU_MANUAL_HOOK après olddefconfig ==="
+
+if grep -q "# CONFIG_KSU_MANUAL_HOOK is not set" out/.config; then
+    sed -i 's/# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
+fi
+if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+    echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
+fi
+
+for opt in KSU_MANUAL_HOOK_AUTO_SETUID_HOOK KSU_MANUAL_HOOK_AUTO_INITRC_HOOK KSU_MANUAL_HOOK_AUTO_INPUT_HOOK; do
+    if grep -q "# CONFIG_${opt} is not set" out/.config; then
+        sed -i "s/# CONFIG_${opt} is not set/CONFIG_${opt}=y/" out/.config
+    fi
+    if ! grep -q "^CONFIG_${opt}=y" out/.config; then
+        echo "CONFIG_${opt}=y" >> out/.config
+    fi
+done
+
+if grep -q "# CONFIG_KPROBES is not set" out/.config; then
+    sed -i 's/# CONFIG_KPROBES is not set/CONFIG_KPROBES=y/' out/.config
+fi
+
+if grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
+    sed -i 's/^CONFIG_KSU_SUSFS=y/# CONFIG_KSU_SUSFS is not set/' out/.config
+fi
+
+make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
+
+echo ""
+echo "=== VÉRIFICATION FINALE DE LA CONFIG ==="
+FAIL=0
+for opt in KSU_MANUAL_HOOK KSU_MANUAL_HOOK_AUTO_INITRC_HOOK KSU_MANUAL_HOOK_AUTO_INPUT_HOOK KPROBES; do
+    if grep -q "^CONFIG_${opt}=y" out/.config; then
+        echo "  ✅ CONFIG_${opt}=y"
+    else
+        echo "  ❌ CONFIG_${opt} NON ACTIF"
+        FAIL=1
+    fi
+done
+if grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
+    echo "  ⚠️  CONFIG_KSU_SUSFS=y (devrait être désactivé)"
+    FAIL=1
+else
+    echo "  ✅ CONFIG_KSU_SUSFS désactivé"
+fi
+
+if [ "$FAIL" -eq 1 ]; then
+    echo ""
+    echo "❌ ERREUR : La config n'a pas été correctement appliquée."
+    exit 1
+fi
+echo "✅ Configuration validée : MANUAL_HOOK + AUTO_* + KPROBES (sans SUSFS)"
+
+# ==================== 6. PATCH SIGNATURES + TACTILE ====================
 echo ""
 echo "=== Patch signatures modules + tactile ==="
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
 echo "✅ Patches Motorola appliqués"
 
-# ==================== 8. COMPILATION ====================
+# ==================== 7. COMPILATION ====================
 echo ""
 echo "=== Compilation finale ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
@@ -529,7 +575,7 @@ else
     exit 1
 fi
 
-# ==================== 9. REPACK ====================
+# ==================== 8. REPACK ====================
 echo ""
 echo "=== Repack avec Google Drive ==="
 cd "$GITHUB_WORKSPACE"
@@ -564,7 +610,7 @@ cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 mv new-boot.img ../final_boot.img
 cd ..
 
-# ==================== 10. DIAGNOSTIC POST-REPACK ====================
+# ==================== 9. DIAGNOSTIC POST-REPACK ====================
 echo ""
 echo "=== DIAGNOSTIC POST-REPACK ==="
 mkdir -p verify
@@ -576,10 +622,8 @@ if [ -f "kernel" ]; then
     HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
     if [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ]; then
         echo "✅ Noyau extrait IDENTIQUE au noyau compilé"
-    else
-        echo "⚠️  Noyau extrait DIFFÈRE"
     fi
-    for sym in "kernelsu" "susfs" "KERNEL_SU_RC" "ksu_ksud_init"; do
+    for sym in "kernelsu" "KERNEL_SU_RC" "ksu_ksud_init"; do
         if strings kernel 2>/dev/null | grep -q "$sym"; then
             echo "  ✅ '$sym' trouvé"
         else
@@ -589,14 +633,15 @@ if [ -f "kernel" ]; then
 fi
 cd ..
 
-# ==================== 11. SORTIE ====================
+# ==================== 10. SORTIE ====================
 mkdir -p output
 cp final_boot.img output/ReSukiSU-Albanel-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ (test-albanel-v2) ==="
+echo "=== BUILD TERMINÉ (test-albanel-v4) ==="
 echo "Source : Albanel22/ReSukiSU"
-echo "Mode : MANUAL_HOOK + AUTO_* + KPROBES + SUSFS"
+echo "Mode : MANUAL_HOOK seul (SUSFS désactivé)"
+echo "Static exports SELinux : activés"
 echo "Nettoyage Unicode : activé"
 ls -lh output/
