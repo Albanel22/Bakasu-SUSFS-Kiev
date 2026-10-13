@@ -199,17 +199,35 @@ path.write_text(content)
 print("[+] disable_seccomp() patchée")
 PYEOF_SECCOMP_FIX
 
-# ==================== 5. CONFIGURATION ====================
-export ARCH=arm64; export SUBARCH=arm64
+# ==================== 4. CONFIGURATION ====================
+echo "=== Configuration ==="
+export ARCH=arm64
+export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-mkdir -p out
-make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
+# Nettoyage complet de la configuration précédente pour éviter les conflits
+rm -rf out/.config
+
+CONFIG_NAME="vendor/lito-perf_defconfig"
+echo "Config utilisée : $CONFIG_NAME"
+
+if [ ! -f "arch/arm64/configs/$CONFIG_NAME" ]; then
+  echo "❌ $CONFIG_NAME introuvable !"
+  exit 1
+fi
+
+# Génération initiale de la config
+make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 $CONFIG_NAME
+
+# Injection forcée de TOUS les paramètres KSU et SUSFS à la fin du fichier .config
 {
   echo "CONFIG_KSU=y"
-  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
+  echo "CONFIG_KSU_MANUAL_HOOK=y"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
+  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y"
+  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y"
+  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"
   echo "# CONFIG_KPROBES is not set"
   echo "CONFIG_COMPAT=y"
   echo "CONFIG_COMPAT_32BIT_TIME=y"
@@ -220,10 +238,36 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
   echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
   echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+  echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+  echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+  echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+  echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+  echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
 } >> out/.config
 
+# Application de olddefconfig en s'assurant de ne pas perdre nos ajouts
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
-grep -E "KSU_MANUAL_HOOK|KSU_TRACEPOINT|KPROBES|KSU_SUSFS" out/.config || true
+
+# Double vérification et ré-injection si écrasé par olddefconfig
+if ! grep -q "CONFIG_KSU=y" out/.config; then
+    echo "CONFIG_KSU=y" >> out/.config
+fi
+if grep -q "# CONFIG_KSU_MANUAL_HOOK is not set" out/.config; then
+    sed -i 's/# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
+fi
+if ! grep -q "CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+    echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
+fi
+if grep -q "^CONFIG_KPROBES=y" out/.config; then
+    sed -i 's/^CONFIG_KPROBES=y/# CONFIG_KPROBES is not set/' out/.config
+fi
+
+echo "=== État final .config (Vérification KSU) ==="
+grep -E "CONFIG_KSU(=y)?|CONFIG_KSU_MANUAL_HOOK" out/.config
+
 
 # ==================== 5b. PATCHS MOTOROLA ====================
 echo ""
