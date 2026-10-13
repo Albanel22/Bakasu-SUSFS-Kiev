@@ -2,12 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-MANUAL-HOOK-V3 : 8 hooks avec vérification stricte
-# Objectif : lancer ksud via init.rc injection
-# Base : branche main + MANUAL_HOOK + 8 hooks
+# BRANCHE TEST-MANUAL-HOOK-V4 : 8 hooks avec patterns kernel 4.19
+# Correctif : hook 3 (stat) utilise "error =" au lieu de "return"
 # =============================================================================
 
-echo "=== Build BakaSU (Manual Hook complet v3) pour kiev ==="
+echo "=== Build BakaSU (Manual Hook complet v4) pour kiev ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -62,7 +61,7 @@ echo ""
 echo "=== Insertion des 8 hooks manuels ==="
 
 # --- Hook 1 : execveat (fs/exec.c) ---
-if ! grep -q "ksu_handle_execveat((int \*)AT_FDCWD\|ksu_handle_execveat(&fd\|ksu_handle_execveat(" fs/exec.c; then
+if ! grep -q "ksu_handle_execveat(" fs/exec.c; then
   cat > /tmp/h1.py << 'PYEOF'
 import re
 with open('fs/exec.c', 'r') as f: content = f.read()
@@ -126,8 +125,8 @@ PYEOF
   python3 /tmp/h2.py
 fi
 
-# --- Hooks 3,4,5 : stat (fs/stat.c) — avec patterns FLEXIBLES ---
-if ! grep -q "ksu_handle_stat(&dfd" fs/stat.c || ! grep -q "ksu_handle_newfstat_ret(&fd" fs/stat.c; then
+# --- Hooks 3,4,5 : stat (fs/stat.c) — PATTERN KERNEL 4.19 ---
+if ! grep -q "ksu_handle_stat(&dfd" fs/stat.c; then
   cat > /tmp/h345.py << 'PYEOF'
 import re
 with open('fs/stat.c', 'r') as f: content = f.read()
@@ -150,63 +149,102 @@ extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **sta
         print("  → externs ajoutés à fs/stat.c")
 
 # Hook 3 : ksu_handle_stat dans SYSCALL_DEFINE4(newfstatat)
+# CORRECTIF 4.19 : "error = vfs_fstatat" (pas "return vfs_fstatat")
 if 'ksu_handle_stat(&dfd' not in content:
-    # Pattern flexible : chercher "return vfs_fstatat(dfd, filename, &stat, flag);"
-    pattern = r'(\tstruct kstat stat;\s*\n\s*int error;\s*\n\s*\n\s*return vfs_fstatat\(dfd, filename, &stat, flag\);)'
-    match = re.search(pattern, content)
-    if match:
-        old = match.group(0)
-        new = old.replace(
-            '\treturn vfs_fstatat(dfd, filename, &stat, flag);',
-            '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+    old = '\terror = vfs_fstatat(dfd, filename, &stat, flag);'
+    new = '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 	ksu_handle_stat(&dfd, &filename, &flag);
 #endif
-	return vfs_fstatat(dfd, filename, &stat, flag);'''
-        )
+	error = vfs_fstatat(dfd, filename, &stat, flag);'''
+    if old in content:
         content = content.replace(old, new, 1)
         print("OK: hook 3/8 stat")
     else:
-        print("⚠️  hook 3/8 stat: pattern non trouvé")
-
-# Hook 4 : ksu_handle_newfstat_ret dans SYSCALL_DEFINE2(newfstat)
-if 'ksu_handle_newfstat_ret(&fd' not in content:
-    pattern = r'(SYSCALL_DEFINE2\(newfstat, unsigned int, fd, struct stat __user \*, statbuf\)\s*\{[^}]*?if \(!error\)\s*\n\s*error = cp_new_stat\(&stat, statbuf\);\s*\n\s*\n\s*return error;)'
-    match = re.search(pattern, content, re.DOTALL)
-    if match:
-        old = match.group(0)
-        new = old.replace(
-            '\treturn error;',
-            '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	ksu_handle_newfstat_ret(&fd, &statbuf);
+        # Fallback : essayer "return vfs_fstatat" (ancien pattern)
+        old2 = '\treturn vfs_fstatat(dfd, filename, &stat, flag);'
+        new2 = '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_stat(&dfd, &filename, &flag);
 #endif
-	return error;''', 1
-        )
-        content = content.replace(old, new, 1)
-        print("OK: hook 4/8 newfstat_ret")
-    else:
-        print("⚠️  hook 4/8 newfstat_ret: pattern non trouvé")
-
-# Hook 5 : ksu_handle_fstat64_ret dans SYSCALL_DEFINE2(fstat64)
-if 'ksu_handle_fstat64_ret(&fd' not in content:
-    pattern = r'(SYSCALL_DEFINE2\(fstat64, unsigned long, fd, struct stat64 __user \*, statbuf\)\s*\{[^}]*?if \(!error\)\s*\n\s*error = cp_new_stat64\(&stat, statbuf\);\s*\n\s*\n\s*return error;)'
-    match = re.search(pattern, content, re.DOTALL)
-    if match:
-        old = match.group(0)
-        new = old.replace(
-            '\treturn error;',
-            '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	ksu_handle_fstat64_ret(&fd, &statbuf);
-#endif
-	return error;''', 1
-        )
-        content = content.replace(old, new, 1)
-        print("OK: hook 5/8 fstat64_ret")
-    else:
-        print("⚠️  hook 5/8 fstat64_ret: pattern non trouvé")
+	return vfs_fstatat(dfd, filename, &stat, flag);'''
+        if old2 in content:
+            content = content.replace(old2, new2, 1)
+            print("OK: hook 3/8 stat (fallback)")
+        else:
+            print("⚠️  hook 3/8 stat: aucun pattern trouvé")
 
 with open('fs/stat.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h345.py
+fi
+
+# --- Hook 4 : newfstat_ret (fs/stat.c) ---
+if ! grep -q "ksu_handle_newfstat_ret(&fd" fs/stat.c; then
+  cat > /tmp/h4.py << 'PYEOF'
+import re
+with open('fs/stat.c', 'r') as f: content = f.read()
+if 'ksu_handle_newfstat_ret(&fd' not in content:
+    old = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+{
+	struct kstat stat;
+	int error = vfs_fstat(fd, &stat);
+
+	if (!error)
+		error = cp_new_stat(&stat, statbuf);
+
+	return error;'''
+    new = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+{
+	struct kstat stat;
+	int error = vfs_fstat(fd, &stat);
+
+	if (!error)
+		error = cp_new_stat(&stat, statbuf);
+
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_newfstat_ret(&fd, &statbuf);
+#endif
+	return error;'''
+    if old in content:
+        content = content.replace(old, new, 1)
+        print("OK: hook 4/8 newfstat_ret")
+with open('fs/stat.c', 'w') as f: f.write(content)
+PYEOF
+  python3 /tmp/h4.py
+fi
+
+# --- Hook 5 : fstat64_ret (fs/stat.c) ---
+if ! grep -q "ksu_handle_fstat64_ret(&fd" fs/stat.c; then
+  cat > /tmp/h5.py << 'PYEOF'
+import re
+with open('fs/stat.c', 'r') as f: content = f.read()
+if 'ksu_handle_fstat64_ret(&fd' not in content:
+    old = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+{
+	struct kstat stat;
+	int error = vfs_fstat(fd, &stat);
+
+	if (!error)
+		error = cp_new_stat64(&stat, statbuf);
+
+	return error;'''
+    new = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+{
+	struct kstat stat;
+	int error = vfs_fstat(fd, &stat);
+
+	if (!error)
+		error = cp_new_stat64(&stat, statbuf);
+
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_fstat64_ret(&fd, &statbuf);
+#endif
+	return error;'''
+    if old in content:
+        content = content.replace(old, new, 1)
+        print("OK: hook 5/8 fstat64_ret")
+with open('fs/stat.c', 'w') as f: f.write(content)
+PYEOF
+  python3 /tmp/h5.py
 fi
 
 # --- Hook 6 : sys_reboot (kernel/reboot.c) ---
@@ -308,46 +346,32 @@ fi
 # ==================== 5. VÉRIFICATION STRICTE ====================
 echo ""
 echo "=== VÉRIFICATION STRICTE des 8 hooks ==="
-echo "  (on vérifie l'APPEL, pas juste l'extern)"
 HOOKS_OK=1
-
 check_hook_call() {
     local fn="$1"; local file="$2"; local pattern="$3"
     if grep -q "$pattern" "$file" 2>/dev/null; then
         echo "  ✅ $fn APPELÉ dans $file"
     else
-        echo "  ❌ $fn NON APPELÉ dans $file (pattern: $pattern)"
+        echo "  ❌ $fn NON APPELÉ dans $file"
         HOOKS_OK=0
     fi
 }
-
-check_hook_call "execveat"          "fs/exec.c"                    "ksu_handle_execveat("
-check_hook_call "faccessat"         "fs/open.c"                    "ksu_handle_faccessat(&dfd"
-check_hook_call "stat"              "fs/stat.c"                    "ksu_handle_stat(&dfd"
-check_hook_call "newfstat_ret"      "fs/stat.c"                    "ksu_handle_newfstat_ret(&fd"
-check_hook_call "fstat64_ret"       "fs/stat.c"                    "ksu_handle_fstat64_ret(&fd"
-check_hook_call "sys_reboot"        "kernel/reboot.c"              "ksu_handle_sys_reboot(magic1"
-check_hook_call "setresuid"         "kernel/sys.c"                 "ksu_handle_setresuid(ruid"
-check_hook_call "input_event"       "drivers/input/input.c"        "ksu_handle_input_handle_event(&type"
+check_hook_call "execveat"          "fs/exec.c"              "ksu_handle_execveat("
+check_hook_call "faccessat"         "fs/open.c"              "ksu_handle_faccessat(&dfd"
+check_hook_call "stat"              "fs/stat.c"              "ksu_handle_stat(&dfd"
+check_hook_call "newfstat_ret"      "fs/stat.c"              "ksu_handle_newfstat_ret(&fd"
+check_hook_call "fstat64_ret"       "fs/stat.c"              "ksu_handle_fstat64_ret(&fd"
+check_hook_call "sys_reboot"        "kernel/reboot.c"        "ksu_handle_sys_reboot(magic1"
+check_hook_call "setresuid"         "kernel/sys.c"           "ksu_handle_setresuid(ruid"
+check_hook_call "input_event"       "drivers/input/input.c"  "ksu_handle_input_handle_event(&type"
 
 if [ "$HOOKS_OK" -eq 0 ]; then
     echo ""
-    echo "❌ ERREUR CRITIQUE : Des hooks ne sont pas appelés dans le noyau."
-    echo "   Le kernel panicera au boot si on continue."
-    echo ""
-    echo "=== DIAGNOSTIC : contenu des fonctions concernées ==="
-    echo ""
-    echo "--- fs/stat.c (autour de newfstatat) ---"
+    echo "❌ ERREUR CRITIQUE : Des hooks ne sont pas appelés."
+    echo "=== DIAGNOSTIC fs/stat.c ==="
     grep -n "SYSCALL_DEFINE4(newfstatat\|vfs_fstatat\|ksu_handle_stat" fs/stat.c | head -10
-    echo ""
-    echo "--- fs/stat.c (autour de newfstat) ---"
-    grep -n "SYSCALL_DEFINE2(newfstat\|cp_new_stat\|ksu_handle_newfstat" fs/stat.c | head -10
-    echo ""
-    echo "--- fs/stat.c (autour de fstat64) ---"
-    grep -n "SYSCALL_DEFINE2(fstat64\|cp_new_stat64\|ksu_handle_fstat64" fs/stat.c | head -10
     exit 1
 fi
-
 echo ""
 echo "✅ Les 8 hooks sont correctement appelés"
 
@@ -525,10 +549,10 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-manual-v3-boot.img 2>/dev/null || true
+cp final_boot.img output/BakaSU-manual-v4-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ (test-manual-hook-v3) ==="
+echo "=== BUILD TERMINÉ (test-manual-hook-v4) ==="
 ls -lh output/
