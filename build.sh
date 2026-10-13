@@ -28,7 +28,7 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. BakaSU (Intégration directe) ====================
+# ==================== 2. BakaSU (Intégration directe AVANT config) ====================
 echo "=== Intégration directe BakaSU ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
@@ -204,7 +204,7 @@ path.write_text(content)
 print("[+] disable_seccomp() patchée")
 PYEOF_SECCOMP_FIX
 
-# ==================== 4. CONFIGURATION ====================
+# ==================== 5. CONFIGURATION ====================
 echo "=== Configuration ==="
 export ARCH=arm64
 export SUBARCH=arm64
