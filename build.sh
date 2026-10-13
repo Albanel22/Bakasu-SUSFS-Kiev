@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-MANUAL-HOOK-V4 : 8 hooks avec patterns kernel 4.19
-# Correctif : hook 3 (stat) utilise "error =" au lieu de "return"
+# BRANCHE TEST-MANUAL-HOOK-V5 : 9 hooks (8 + sys_read)
+# Correctif : ajout du hook ksu_handle_sys_read dans fs/read_write.c
 # =============================================================================
 
-echo "=== Build BakaSU (Manual Hook complet v4) pour kiev ==="
+echo "=== Build BakaSU (Manual Hook complet v5) pour kiev ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -56,9 +56,9 @@ for pattern in "${CHECK_FILES[@]}"; do
 done
 echo "✅ Neutralisation ciblée terminée"
 
-# ==================== 4. 8 HOOKS ====================
+# ==================== 4. 9 HOOKS ====================
 echo ""
-echo "=== Insertion des 8 hooks manuels ==="
+echo "=== Insertion des 9 hooks manuels ==="
 
 # --- Hook 1 : execveat (fs/exec.c) ---
 if ! grep -q "ksu_handle_execveat(" fs/exec.c; then
@@ -86,7 +86,7 @@ extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
 #endif'''
     if old in content:
         content = content.replace(old, new, 1)
-        print("OK: hook 1/8 execveat")
+        print("OK: hook 1/9 execveat")
 with open('fs/exec.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h1.py
@@ -119,19 +119,18 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
 	return do_faccessat(dfd, filename, mode);'''
     if old in content:
         content = content.replace(old, new, 1)
-        print("OK: hook 2/8 faccessat")
+        print("OK: hook 2/9 faccessat")
 with open('fs/open.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h2.py
 fi
 
-# --- Hooks 3,4,5 : stat (fs/stat.c) — PATTERN KERNEL 4.19 ---
+# --- Hooks 3,4,5 : stat (fs/stat.c) ---
 if ! grep -q "ksu_handle_stat(&dfd" fs/stat.c; then
   cat > /tmp/h345.py << 'PYEOF'
 import re
 with open('fs/stat.c', 'r') as f: content = f.read()
 
-# Ajouter les externs si absents
 if 'extern int ksu_handle_stat' not in content:
     extern_decl = '''
 #if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
@@ -148,8 +147,7 @@ extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **sta
         content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
         print("  → externs ajoutés à fs/stat.c")
 
-# Hook 3 : ksu_handle_stat dans SYSCALL_DEFINE4(newfstatat)
-# CORRECTIF 4.19 : "error = vfs_fstatat" (pas "return vfs_fstatat")
+# Hook 3 : ksu_handle_stat
 if 'ksu_handle_stat(&dfd' not in content:
     old = '\terror = vfs_fstatat(dfd, filename, &stat, flag);'
     new = '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
@@ -158,9 +156,8 @@ if 'ksu_handle_stat(&dfd' not in content:
 	error = vfs_fstatat(dfd, filename, &stat, flag);'''
     if old in content:
         content = content.replace(old, new, 1)
-        print("OK: hook 3/8 stat")
+        print("OK: hook 3/9 stat")
     else:
-        # Fallback : essayer "return vfs_fstatat" (ancien pattern)
         old2 = '\treturn vfs_fstatat(dfd, filename, &stat, flag);'
         new2 = '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 	ksu_handle_stat(&dfd, &filename, &flag);
@@ -168,20 +165,9 @@ if 'ksu_handle_stat(&dfd' not in content:
 	return vfs_fstatat(dfd, filename, &stat, flag);'''
         if old2 in content:
             content = content.replace(old2, new2, 1)
-            print("OK: hook 3/8 stat (fallback)")
-        else:
-            print("⚠️  hook 3/8 stat: aucun pattern trouvé")
+            print("OK: hook 3/9 stat (fallback)")
 
-with open('fs/stat.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h345.py
-fi
-
-# --- Hook 4 : newfstat_ret (fs/stat.c) ---
-if ! grep -q "ksu_handle_newfstat_ret(&fd" fs/stat.c; then
-  cat > /tmp/h4.py << 'PYEOF'
-import re
-with open('fs/stat.c', 'r') as f: content = f.read()
+# Hook 4 : ksu_handle_newfstat_ret
 if 'ksu_handle_newfstat_ret(&fd' not in content:
     old = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
 {
@@ -206,17 +192,9 @@ if 'ksu_handle_newfstat_ret(&fd' not in content:
 	return error;'''
     if old in content:
         content = content.replace(old, new, 1)
-        print("OK: hook 4/8 newfstat_ret")
-with open('fs/stat.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h4.py
-fi
+        print("OK: hook 4/9 newfstat_ret")
 
-# --- Hook 5 : fstat64_ret (fs/stat.c) ---
-if ! grep -q "ksu_handle_fstat64_ret(&fd" fs/stat.c; then
-  cat > /tmp/h5.py << 'PYEOF'
-import re
-with open('fs/stat.c', 'r') as f: content = f.read()
+# Hook 5 : ksu_handle_fstat64_ret
 if 'ksu_handle_fstat64_ret(&fd' not in content:
     old = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
 {
@@ -241,10 +219,11 @@ if 'ksu_handle_fstat64_ret(&fd' not in content:
 	return error;'''
     if old in content:
         content = content.replace(old, new, 1)
-        print("OK: hook 5/8 fstat64_ret")
+        print("OK: hook 5/9 fstat64_ret")
+
 with open('fs/stat.c', 'w') as f: f.write(content)
 PYEOF
-  python3 /tmp/h5.py
+  python3 /tmp/h345.py
 fi
 
 # --- Hook 6 : sys_reboot (kernel/reboot.c) ---
@@ -271,7 +250,7 @@ extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void 
 #endif'''
     if old in content:
         content = content.replace(old, new, 1)
-        print("OK: hook 6/8 sys_reboot")
+        print("OK: hook 6/9 sys_reboot")
 with open('kernel/reboot.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h6.py
@@ -298,7 +277,7 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
     for marker in ['\tbool ruid_new, euid_new, suid_new;', '\tkuid_t kruid, keuid, ksuid;']:
         if marker in content:
             content = content.replace(marker, marker + '\n' + hook_code, 1)
-            print("OK: hook 7/8 setresuid")
+            print("OK: hook 7/9 setresuid")
             break
 with open('kernel/sys.c', 'w') as f: f.write(content)
 PYEOF
@@ -337,15 +316,50 @@ extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code,
 	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
     if old in content:
         content = content.replace(old, new, 1)
-        print("OK: hook 8/8 input_event")
+        print("OK: hook 8/9 input_event")
 with open('drivers/input/input.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h8.py
 fi
 
-# ==================== 5. VÉRIFICATION STRICTE ====================
+# --- Hook 9 : sys_read (fs/read_write.c) — NOUVEAU ---
+if ! grep -q "ksu_handle_sys_read(" fs/read_write.c; then
+  cat > /tmp/h9.py << 'PYEOF'
+import re
+with open('fs/read_write.c', 'r') as f: content = f.read()
+if 'ksu_handle_sys_read(' not in content:
+    extern_decl = '''
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+__attribute__((hot))
+extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
+#endif
+'''
+    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
+    if m and 'extern int ksu_handle_sys_read' not in content:
+        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
+    
+    # Hook dans SYSCALL_DEFINE3(read, ...)
+    old = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+{'''
+    new = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+{
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
+	ksu_handle_sys_read(fd, &buf, &count);
+#endif'''
+    if old in content:
+        content = content.replace(old, new, 1)
+        print("OK: hook 9/9 sys_read")
+    else:
+        print("⚠️  hook 9/9 sys_read: pattern SYSCALL_DEFINE3(read non trouvé")
+
+with open('fs/read_write.c', 'w') as f: f.write(content)
+PYEOF
+  python3 /tmp/h9.py
+fi
+
+# ==================== 5. VÉRIFICATION STRICTE DES 9 HOOKS ====================
 echo ""
-echo "=== VÉRIFICATION STRICTE des 8 hooks ==="
+echo "=== VÉRIFICATION STRICTE des 9 hooks ==="
 HOOKS_OK=1
 check_hook_call() {
     local fn="$1"; local file="$2"; local pattern="$3"
@@ -364,16 +378,15 @@ check_hook_call "fstat64_ret"       "fs/stat.c"              "ksu_handle_fstat64
 check_hook_call "sys_reboot"        "kernel/reboot.c"        "ksu_handle_sys_reboot(magic1"
 check_hook_call "setresuid"         "kernel/sys.c"           "ksu_handle_setresuid(ruid"
 check_hook_call "input_event"       "drivers/input/input.c"  "ksu_handle_input_handle_event(&type"
+check_hook_call "sys_read"          "fs/read_write.c"        "ksu_handle_sys_read("
 
 if [ "$HOOKS_OK" -eq 0 ]; then
     echo ""
     echo "❌ ERREUR CRITIQUE : Des hooks ne sont pas appelés."
-    echo "=== DIAGNOSTIC fs/stat.c ==="
-    grep -n "SYSCALL_DEFINE4(newfstatat\|vfs_fstatat\|ksu_handle_stat" fs/stat.c | head -10
     exit 1
 fi
 echo ""
-echo "✅ Les 8 hooks sont correctement appelés"
+echo "✅ Les 9 hooks sont correctement appelés"
 
 # ==================== 6. CONFIGURATION ====================
 echo ""
@@ -549,10 +562,10 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-manual-v4-boot.img 2>/dev/null || true
+cp final_boot.img output/BakaSU-manual-v5-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ (test-manual-hook-v4) ==="
+echo "=== BUILD TERMINÉ (test-manual-hook-v5) ==="
 ls -lh output/
