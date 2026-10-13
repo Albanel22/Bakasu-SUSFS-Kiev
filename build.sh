@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-ALBANEL-V1 : Reproduction exacte de l'ancien script qui marchait
+# BRANCHE TEST-ALBANEL-V2 : Nettoyage Unicode + 9 hooks ReSukiSU
 # Source : Albanel22/ReSukiSU (fork intact d'août 2026, v4.2.0-rc1)
 # Patch SUSFS : JackA1ltman (celui de l'ancien script)
 # Images : Google Drive (boot.img + dtbo.img du 2026-09-20)
@@ -35,7 +35,6 @@ git log --oneline -1
 echo "=== Intégration ReSukiSU (Albanel22) ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
-# Clone direct de ton fork
 git clone --depth=1 https://github.com/Albanel22/ReSukiSU.git KernelSU
 if [ ! -d "KernelSU/kernel" ]; then
     echo "❌ KernelSU/kernel introuvable après clone"
@@ -43,7 +42,6 @@ if [ ! -d "KernelSU/kernel" ]; then
 fi
 echo "✅ ReSukiSU (Albanel22) cloné"
 
-# Lien symbolique + Makefile + Kconfig (méthode du setup.sh)
 DRIVER_DIR="drivers"
 ln -sf "$(realpath --relative-to="$DRIVER_DIR" "$(pwd)/KernelSU/kernel")" "$DRIVER_DIR/kernelsu"
 
@@ -56,6 +54,68 @@ fi
 
 KSU_DIR="KernelSU"
 echo "KSU_DIR détecté : $KSU_DIR"
+
+# ==================== 2b. NETTOYAGE UNICODE ROBUSTE ====================
+echo ""
+echo "=== Nettoyage Unicode robuste de KernelSU ==="
+
+python3 << 'PYEOF'
+import os
+from pathlib import Path
+
+# Caractères Unicode à remplacer par des espaces ASCII
+UNICODE_SPACES = [
+    '\u00A0',  # Espace insécable
+    '\u2000',  # En quad
+    '\u2001',  # Em quad
+    '\u2002',  # En space
+    '\u2003',  # Em space
+    '\u2004',  # Three-per-em space
+    '\u2005',  # Four-per-em space
+    '\u2006',  # Six-per-em space
+    '\u2007',  # Figure space
+    '\u2008',  # Punctuation space
+    '\u2009',  # Thin space
+    '\u200A',  # Hair space
+    '\u200B',  # Zero-width space
+    '\u202F',  # Narrow no-break space
+    '\u205F',  # Medium mathematical space
+    '\u3000',  # Ideographic space
+]
+
+count_files = 0
+count_fixes = 0
+
+for root, dirs, files in os.walk('KernelSU'):
+    for file in files:
+        if file.endswith(('.c', '.h')):
+            filepath = Path(root) / file
+            try:
+                content = filepath.read_text(encoding='utf-8', errors='ignore')
+                original = content
+                for uchar in UNICODE_SPACES:
+                    if uchar in content:
+                        content = content.replace(uchar, ' ')
+                        count_fixes += 1
+                if content != original:
+                    filepath.write_text(content, encoding='utf-8')
+                    count_files += 1
+            except Exception as e:
+                print(f"  ⚠️  Erreur sur {filepath}: {e}")
+
+print(f"✅ {count_files} fichiers nettoyés, {count_fixes} remplacements effectués")
+PYEOF
+
+# Vérification post-nettoyage
+echo ""
+echo "=== Vérification post-nettoyage ==="
+UNICODE_REMAINING=$(grep -rlP '[\x{00A0}\x{2000}-\x{200B}\x{202F}\x{205F}\x{3000}]' "$KSU_DIR" --include="*.c" --include="*.h" 2>/dev/null || true)
+if [ -n "$UNICODE_REMAINING" ]; then
+    echo "  ⚠️  Unicode restant dans :"
+    echo "$UNICODE_REMAINING" | head -5
+else
+    echo "  ✅ Aucun Unicode restant détecté"
+fi
 
 # ==================== 3. HOOKS ReSukiSU (double garde) ====================
 echo ""
@@ -161,7 +221,6 @@ if 'ksu_handle_stat(&dfd' not in content:
         content = content.replace(old_code, new_code, 1)
         print("OK: stat")
     else:
-        # Fallback kernel 4.19 : "error = vfs_fstatat"
         old_code2 = '\terror = vfs_fstatat(dfd, filename, &stat, flag);'
         new_code2 = '''#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 	ksu_handle_stat(&dfd, &filename, &flag);
@@ -284,7 +343,7 @@ PYEOF
   python3 /tmp/h_setresuid.py
 fi
 
-# --- Hook 8 : sys_read (fs/read_write.c) — SIGNATURE ALBANEL ---
+# --- Hook 8 : sys_read (fs/read_write.c) ---
 if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
   cat > /tmp/h_read.py << 'PYEOF'
 import re
@@ -360,7 +419,6 @@ echo "✅ Patch SUSFS appliqué"
 echo ""
 echo "=== Corrections post-patch ==="
 
-# vma __maybe_unused
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     if [ -f "$f" ]; then
         sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
@@ -368,12 +426,10 @@ for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
 done
 echo "  ✅ vma __maybe_unused"
 
-# Include susfs_def.h dans namespace.c
 if [ -f "fs/namespace.c" ] && ! grep -q "susfs_def.h" fs/namespace.c; then
     sed -i '/#include <linux\/sched\/task.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n#define CL_COPY_MNT_NS BIT(25)\n#endif' fs/namespace.c
 fi
 
-# Include susfs_def.h dans super.c
 if [ -f "fs/super.c" ] && ! grep -q "susfs_def.h" fs/super.c; then
     python3 << 'PYEOF'
 import re
@@ -399,7 +455,6 @@ extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
 PYEOF
 fi
 
-# Fix fs/stat.c : include susfs_def.h
 if [ -f "fs/stat.c" ] && ! grep -q "susfs_def.h" fs/stat.c; then
     python3 << 'PYEOF'
 from pathlib import Path
@@ -540,7 +595,8 @@ cp final_boot.img output/ReSukiSU-Albanel-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ (test-albanel-v1) ==="
+echo "=== BUILD TERMINÉ (test-albanel-v2) ==="
 echo "Source : Albanel22/ReSukiSU"
 echo "Mode : MANUAL_HOOK + AUTO_* + KPROBES + SUSFS"
+echo "Nettoyage Unicode : activé"
 ls -lh output/
