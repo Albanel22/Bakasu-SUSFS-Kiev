@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST : BakaSU + MANUAL_HOOK + KPROBES
-# Objectif : faire détecter le pilote par le manager
-# Base : script sécurisé (main) + mode hook modifié
+# BUILD SÉCURISÉ : LineageOS 23.2 + BakaSU (SuSFS Inline) + patches Motorola
+# Appareil : Motorola One 5G Ace (kiev / SM8250)
+# Statut : Boot OK, Tactile OK, Repack OK, Manager à résoudre
 # =============================================================================
 
-echo "=== Build BakaSU (Manual Hook) + patches Motorola pour kiev ==="
+echo "=== Build BakaSU (SuSFS Inline) + patches Motorola pour kiev ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -200,181 +200,6 @@ path.write_text(content)
 print("[+] disable_seccomp() patchée")
 PYEOF_SECCOMP_FIX
 
-# ==================== 4c. HOOKS MANUELS (mode MANUAL_HOOK) ====================
-echo ""
-echo "=== Hooks manuels (mode MANUAL_HOOK) ==="
-
-# --- execveat ---
-if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-  cat > /tmp/hook_execveat.py << 'PYEOF'
-import re
-with open('fs/exec.c', 'r') as f: content = f.read()
-if 'ksu_handle_execveat' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-__attribute__((hot))
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-				void *argv, void *envp, int *flags);
-#endif
-'''
-    pattern = r'(static int do_execveat_common\()'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''	struct user_arg_ptr argv = { .ptr.native = __argv };
-	struct user_arg_ptr envp = { .ptr.native = __envp };
-	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
-    new_code = '''	struct user_arg_ptr argv = { .ptr.native = __argv };
-	struct user_arg_ptr envp = { .ptr.native = __envp };
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-#endif
-	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: execveat (double garde)")
-with open('fs/exec.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_execveat.py
-fi
-
-# --- faccessat ---
-if ! grep -q "ksu_handle_faccessat" fs/open.c; then
-  cat > /tmp/hook_faccessat.py << 'PYEOF'
-import re
-with open('fs/open.c', 'r') as f: content = f.read()
-if 'ksu_handle_faccessat' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-__attribute__((hot))
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-				int *mode, int *flags);
-#endif
-'''
-    pattern = r'(SYSCALL_DEFINE3\(faccessat)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-{
-	return do_faccessat(dfd, filename, mode);'''
-    new_code = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-{
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-#endif
-	return do_faccessat(dfd, filename, mode);'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: faccessat (double garde)")
-with open('fs/open.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_faccessat.py
-fi
-
-# --- setresuid ---
-if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
-  cat > /tmp/hook_setresuid.py << 'PYEOF'
-import re
-with open('kernel/sys.c', 'r') as f: content = f.read()
-if 'ksu_handle_setresuid' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
-#endif
-'''
-    pattern = r'(long __sys_setresuid)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''	bool ruid_new, euid_new, suid_new;'''
-    new_code = '''	bool ruid_new, euid_new, suid_new;
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	(void)ksu_handle_setresuid(ruid, euid, suid);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: setresuid (double garde)")
-with open('kernel/sys.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_setresuid.py
-fi
-
-# --- sys_read ---
-if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
-  cat > /tmp/hook_sys_read.py << 'PYEOF'
-import re
-with open('fs/read_write.c', 'r') as f: content = f.read()
-if 'ksu_handle_sys_read' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
-#endif
-'''
-    pattern = r'(SYSCALL_DEFINE3\(read)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-{'''
-    new_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-{
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	ksu_handle_sys_read(fd, &buf, &count);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: sys_read (double garde)")
-with open('fs/read_write.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_sys_read.py
-fi
-
-# --- input_event ---
-if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
-  cat > /tmp/hook_input.py << 'PYEOF'
-import re
-with open('drivers/input/input.c', 'r') as f: content = f.read()
-if 'ksu_handle_input_handle_event' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
-#endif
-'''
-    pattern = r'(void input_event\(struct input_dev \*dev,)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''void input_event(struct input_dev *dev,
-		 unsigned int type, unsigned int code, int value)
-{
-	unsigned long flags;
-
-	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    new_code = '''void input_event(struct input_dev *dev,
-		 unsigned int type, unsigned int code, int value)
-{
-	unsigned long flags;
-
-#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
-	ksu_handle_input_handle_event(&type, &code, &value);
-#endif
-
-	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: input_event (double garde)")
-with open('drivers/input/input.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/hook_input.py
-fi
-
-# Vérification finale des hooks
-echo ""
-echo "=== Vérification finale des hooks ==="
-HOOKS_OK=1
-for hook in ksu_handle_execveat:fs/exec.c ksu_handle_setresuid:kernel/sys.c \
-            ksu_handle_sys_read:fs/read_write.c ksu_handle_input_handle_event:drivers/input/input.c; do
-    fn="${hook%%:*}"; file="${hook##*:}"
-    if grep -q "$fn" "$file" 2>/dev/null; then
-        echo "  ✅ $fn présent dans $file"
-    else
-        echo "  ❌ $fn MANQUANT dans $file"; HOOKS_OK=0
-    fi
-done
-if [ "$HOOKS_OK" -eq 0 ]; then echo "❌ ERREUR CRITIQUE"; exit 1; fi
-echo "✅ Tous les hooks sont en place"
-
 # ==================== 5. CONFIGURATION ====================
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
@@ -384,14 +209,9 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 {
   echo "CONFIG_KSU=y"
-  echo "CONFIG_KSU_MANUAL_HOOK=y"
+  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"
-  echo "CONFIG_KPROBES=y"
-  echo "CONFIG_HAVE_KPROBES=y"
-  echo "CONFIG_KRETPROBES=y"
+  echo "# CONFIG_KPROBES is not set"
   echo "CONFIG_COMPAT=y"
   echo "CONFIG_COMPAT_32BIT_TIME=y"
   echo "CONFIG_KSU_SUSFS=y"
@@ -404,18 +224,6 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 } >> out/.config
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig
-
-echo "=== Forçage MANUAL_HOOK + KPROBES ==="
-if grep -q "# CONFIG_KSU_MANUAL_HOOK is not set" out/.config; then
-    sed -i 's/# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
-fi
-if ! grep -q "CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
-    echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
-fi
-if ! grep -q "CONFIG_KPROBES=y" out/.config; then
-    echo "CONFIG_KPROBES=y" >> out/.config
-fi
-
 grep -E "KSU_MANUAL_HOOK|KSU_TRACEPOINT|KPROBES|KSU_SUSFS" out/.config || true
 
 # ==================== 5b. PATCHS MOTOROLA ====================
@@ -438,10 +246,60 @@ if [ -f "out/arch/arm64/boot/Image" ]; then
     echo "✅ Compilation réussie"
     ls -lh out/arch/arm64/boot/
     sha256sum out/arch/arm64/boot/Image | cut -d' ' -f1 > /tmp/kernel_compiled_hash.txt
+    echo "→ Hash noyau compilé : $(cat /tmp/kernel_compiled_hash.txt)"
 else
     echo "❌ BUILD FAILED"
     grep -iE "error:|fatal error:" build.log | head -30
     exit 1
+fi
+
+# ==================== 6b. DIAGNOSTIC DU PILOTE DANS VMLINUX ====================
+echo ""
+echo "=== Diagnostic : le pilote est-il lié au noyau ? ==="
+
+VMLINUX="out/vmlinux"
+if [ -f "$VMLINUX" ]; then
+    echo "→ Recherche de kernelsu_init dans vmlinux :"
+    if nm "$VMLINUX" 2>/dev/null | grep -q "kernelsu_init"; then
+        echo "  ✅ kernelsu_init présent dans vmlinux"
+        nm "$VMLINUX" 2>/dev/null | grep "kernelsu_init" | head -3
+    else
+        echo "  ❌ kernelsu_init ABSENT de vmlinux"
+    fi
+
+    echo ""
+    echo "→ Recherche de ksu_supercalls_init :"
+    if nm "$VMLINUX" 2>/dev/null | grep -q "ksu_supercalls_init"; then
+        echo "  ✅ ksu_supercalls_init présent"
+    else
+        echo "  ❌ ksu_supercalls_init ABSENT"
+    fi
+
+    echo ""
+    echo "→ Recherche de susfs_init :"
+    if nm "$VMLINUX" 2>/dev/null | grep -q "susfs_init"; then
+        echo "  ✅ susfs_init présent"
+    else
+        echo "  ❌ susfs_init ABSENT"
+    fi
+
+    echo ""
+    echo "→ Message 'Initialized with driver version' :"
+    if strings "$VMLINUX" 2>/dev/null | grep -q "Initialized with driver version"; then
+        echo "  ✅ Message d'init présent (le pilote s'initialise)"
+    else
+        echo "  ❌ Message d'init ABSENT"
+    fi
+
+    echo ""
+    echo "→ Message 'shell is allowed at init' :"
+    if strings "$VMLINUX" 2>/dev/null | grep -q "shell is allowed at init"; then
+        echo "  ✅ Message allow_shell présent"
+    else
+        echo "  ⚠️  Message allow_shell absent (allow_shell désactivé par défaut)"
+    fi
+else
+    echo "❌ $VMLINUX introuvable"
 fi
 
 # ==================== 7. KSUD ====================
@@ -476,9 +334,9 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 8. REPACK ====================
+# ==================== 8. REPACK AVEC allow_shell + DIAGNOSTIC ====================
 echo ""
-echo "=== Repack ==="
+echo "=== Repack avec modification cmdline (allow_shell) ==="
 
 rm -f boot-stock.img
 if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
@@ -504,14 +362,25 @@ if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then
     echo "❌ Échec unpack"; exit 1
 fi
 
+echo ""
+echo "→ Format du noyau original :"
+file kernel 2>/dev/null || true
+head -c 4 kernel | xxd | head -1
+
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
+# Ajout des paramètres allow_shell à la cmdline
 echo "→ Ajout de allow_shell=1 à la cmdline"
 if [ -f "bootimg.cfg" ]; then
     if ! grep -q "allow_shell" bootimg.cfg; then
         sed -i 's/^cmdline = \(.*\)$/cmdline = \1 kernelsu.allow_shell=1 allow_shell=1/' bootimg.cfg
-        echo "  ✅ bootimg.cfg modifié"
+        echo "  ✅ bootimg.cfg modifié :"
+        grep "^cmdline" bootimg.cfg
+    else
+        echo "  [i] allow_shell déjà présent"
     fi
+else
+    echo "  ⚠️ bootimg.cfg absent"
 fi
 
 ./magiskboot cpio ramdisk.cpio \
@@ -534,19 +403,30 @@ mv new-boot.img ../final_boot.img
 # ==================== 8b. DIAGNOSTIC POST-REPACK ====================
 echo ""
 echo "=== DIAGNOSTIC POST-REPACK ==="
+
 mkdir -p ../verify
 cd ../verify
 cp ../final_boot.img verify_boot.img
 ../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
 
 if [ -f "kernel" ]; then
+    echo "→ Taille du noyau extrait : $(du -h kernel | cut -f1)"
+    echo "→ Taille du noyau compilé : $(du -h "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" | cut -f1)"
+
     HASH_EXTRACTED=$(sha256sum kernel | cut -d' ' -f1)
     HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
+
+    echo "→ Hash extrait : $HASH_EXTRACTED"
+    echo "→ Hash compilé : $HASH_COMPILED"
+
     if [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ]; then
-        echo "✅ Noyau extrait IDENTIQUE au noyau compilé"
+        echo "✅ Le noyau extrait est IDENTIQUE au noyau compilé"
     else
-        echo "⚠️  Noyau extrait DIFFÈRE"
+        echo "⚠️  Le noyau extrait DIFFÈRE du noyau compilé !"
     fi
+
+    echo ""
+    echo "→ Recherche des symboles KernelSU/SUSFS dans le noyau extrait :"
     for sym in "kernelsu" "susfs" "ksu_handle" "susfs_is_current"; do
         if strings kernel 2>/dev/null | grep -q "$sym"; then
             echo "  ✅ '$sym' trouvé"
@@ -554,6 +434,8 @@ if [ -f "kernel" ]; then
             echo "  ❌ '$sym' ABSENT"
         fi
     done
+else
+    echo "❌ Impossible d'extraire le noyau de l'image finale"
 fi
 cd ..
 
@@ -564,6 +446,6 @@ cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ (branche test) ==="
-echo "Mode : MANUAL_HOOK + KPROBES"
+echo "=== BUILD TERMINÉ ==="
+echo "Cmdline modifiée : kernelsu.allow_shell=1 allow_shell=1 (si bootimg.cfg présent)"
 ls -lh output/
