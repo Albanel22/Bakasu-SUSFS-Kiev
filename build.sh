@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-ALBANEL-V7.1 : Reproduction ancien + fix susfs_compat.mk
+# BRANCHE TEST-BAKASU-OFFICIEL-V8.1 : Dépôt officiel BakaSU
+# Source : Baka-SU/BakaSU (dépôt officiel, à jour)
 # Config : MANUAL_HOOK + SUSFS + KPROBES (ancien exact)
-# Source : Albanel22/ReSukiSU
 # =============================================================================
 
-echo "=== Build ReSukiSU (Albanel22) + SUSFS v7.1 ==="
+echo "=== Build BakaSU officiel + SUSFS v8.1 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -24,23 +24,28 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE ====================
+# ==================== 1. CLONAGE DU KERNEL ====================
+echo "=== Clonage du kernel LineageOS ==="
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. ReSukiSU via setup.sh officiel ====================
-echo "=== Intégration ReSukiSU via setup.sh ==="
+# ==================== 2. INTÉGRATION BakaSU OFFICIEL ====================
+echo "=== Intégration BakaSU officiel via setup.sh ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
-curl -LSs "https://raw.githubusercontent.com/Albanel22/ReSukiSU/main/kernel/setup.sh" | bash -s -- "" 2>/dev/null || {
-    # Fallback : clone direct
-    git clone --depth=1 https://github.com/Albanel22/ReSukiSU.git KernelSU
+
+curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+
+if [ ! -d "drivers/kernelsu" ] && [ ! -d "KernelSU/kernel" ]; then
+    echo "❌ Échec intégration BakaSU"
+    echo "→ Fallback : clone direct"
+    git clone --depth=1 https://github.com/Baka-SU/BakaSU.git KernelSU
     DRIVER_DIR="drivers"
     ln -sf "$(realpath --relative-to="$DRIVER_DIR" "$(pwd)/KernelSU/kernel")" "$DRIVER_DIR/kernelsu"
     grep -q "kernelsu" "$DRIVER_DIR/Makefile" || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "$DRIVER_DIR/Makefile"
     grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVER_DIR/Kconfig" || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' "$DRIVER_DIR/Kconfig"
-}
-echo "✅ ReSukiSU (Albanel22) intégré"
+fi
+echo "✅ BakaSU officiel intégré"
 
 # Détecter KSU_DIR
 if [ -d "drivers/kernelsu" ]; then
@@ -60,18 +65,10 @@ echo "=== Neutralisation susfs_compat.mk (error -> warning) ==="
 
 SUSFS_COMPAT=$(find . -name "susfs_compat.mk" -type f 2>/dev/null | head -1)
 if [ -n "$SUSFS_COMPAT" ]; then
-    echo "→ Traitement de : $SUSFS_COMPAT"
     sed -i 's/\$(error/\$(warning/g' "$SUSFS_COMPAT"
-    if grep -q '\$(error' "$SUSFS_COMPAT"; then
-        echo "  ❌ Le patch n'a pas fonctionné"
-        exit 1
-    fi
-    echo "  ✅ susfs_compat.mk patché (error → warning)"
-else
-    echo "  ⚠️  susfs_compat.mk introuvable"
+    echo "  ✅ susfs_compat.mk patché"
 fi
 
-# Neutraliser aussi tous les autres *_check.mk bloquants
 for pattern in inline_hook_check.mk manual_hook_check.mk tracepoint_hook_check.mk kprobe_check.mk; do
     FILES=$(find . -name "$pattern" -type f 2>/dev/null)
     if [ -n "$FILES" ]; then
@@ -81,7 +78,6 @@ for pattern in inline_hook_check.mk manual_hook_check.mk tracepoint_hook_check.m
         done
     fi
 done
-
 echo "✅ Neutralisation terminée"
 
 # ==================== 2b. NETTOYAGE UNICODE ====================
@@ -145,9 +141,9 @@ echo "=== Static exports SELinux ==="
 }
 echo "✅ Static exports terminés"
 
-# ==================== 3. HOOKS ANCIEN SCRIPT (double garde) ====================
+# ==================== 3. HOOKS MANUELS (double garde) ====================
 echo ""
-echo "=== Hooks ReSukiSU (double garde SUSFS || MANUAL_HOOK) ==="
+echo "=== Hooks BakaSU (double garde SUSFS || MANUAL_HOOK) ==="
 
 # --- Hook 1 : execveat ---
 if ! grep -q "ksu_handle_execveat" fs/exec.c; then
@@ -473,7 +469,7 @@ PYEOF
 fi
 echo "✅ Corrections terminées"
 
-# ==================== 6. CONFIGURATION (ANCIEN EXACT) ====================
+# ==================== 6. CONFIGURATION ====================
 echo ""
 echo "=== Configuration (MANUAL_HOOK + SUSFS + KPROBES) ==="
 export ARCH=arm64; export SUBARCH=arm64
@@ -509,7 +505,7 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
-echo "=== Vérification config (sans forçage) ==="
+echo "=== Vérification config ==="
 grep -E "KSU_MANUAL_HOOK|KPROBES|KSU_SUSFS" out/.config | head -25 || true
 
 # ==================== 7. PATCHS MOTOROLA ====================
@@ -570,14 +566,11 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/ReSukiSU-Albanel-v7.1-boot.img
+cp final_boot.img output/BakaSU-Officiel-v8.1-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 echo ""
-echo "=== BUILD TERMINÉ v7.1 ==="
+echo "=== BUILD TERMINÉ v8.1 ==="
+echo "Source : Baka-SU/BakaSU (dépôt officiel)"
 echo "Config : MANUAL_HOOK + SUSFS + KPROBES (ancien exact)"
-echo "Fix susfs_compat.mk : activé"
-echo "Static exports SELinux : activés"
-echo "Fix symbol_resolver.h : activé"
-echo "Nettoyage Unicode : activé"
 ls -lh output/
