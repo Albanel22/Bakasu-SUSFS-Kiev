@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-BAKASU-SYSCALL-TABLE-V9.2 : Corrections des 3 bugs
+# BRANCHE TEST-BAKASU-SYSCALL-TABLE-V9.3 : Fix variables Python + 3 bugs
 # Source : Baka-SU/BakaSU officiel
 # =============================================================================
 
-echo "=== Build BakaSU + SYSCALL_TABLE_HOOK v9.2 ==="
+echo "=== Build BakaSU + SYSCALL_TABLE_HOOK v9.3 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -74,25 +74,28 @@ for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepo
 done
 echo "✅ Neutralisation terminée"
 
-# ==================== 2f. PATCH KBUILD CORRIGÉ (avec \$ échappé) ====================
+# ==================== 2f. PATCH KBUILD ROBUSTE (avec os.environ) ====================
 echo ""
 echo "=== Patch Kbuild robuste : syscall_hook.o en MANUAL_HOOK ==="
 
+export KSU_KBUILD
 python3 << 'PYEOF'
+import os
 from pathlib import Path
-import re
 
-kbuild_path = Path("$KSU_KBUILD")
+kbuild_path = Path(os.environ['KSU_KBUILD'])
+if not kbuild_path.exists():
+    print(f"❌ Kbuild introuvable : {kbuild_path}")
+    exit(1)
+
 content = kbuild_path.read_text()
 
-# Vérifier si le patch est déjà appliqué
 if 'syscall_hook_manager.o' in content:
     manual_idx = content.find('else ifdef CONFIG_KSU_MANUAL_HOOK')
     if manual_idx >= 0 and 'syscall_hook_manager.o' in content[manual_idx:manual_idx+2000]:
         print("[i] Kbuild déjà patché")
         exit(0)
 
-# Trouver le bloc MANUAL_HOOK
 manual_marker = 'else ifdef CONFIG_KSU_MANUAL_HOOK'
 manual_idx = content.find(manual_marker)
 
@@ -100,7 +103,6 @@ if manual_idx < 0:
     print("❌ Bloc MANUAL_HOOK introuvable dans Kbuild")
     exit(1)
 
-# Trouver la fin du bloc MANUAL_HOOK
 search_from = manual_idx + len(manual_marker)
 next_else = content.find('else ifdef', search_from)
 next_else2 = content.find('else ifndef', search_from)
@@ -113,21 +115,19 @@ if not candidates:
 
 block_end = min(candidates)
 
-# IMPORTANT: Échapper $ avec \$ dans la chaîne Python
 insertion = '''
-  # V9.2: Activer syscall_hook.o en MANUAL_HOOK pour patcher sys_call_table
+  # V9.3: Activer syscall_hook.o en MANUAL_HOOK pour patcher sys_call_table
   kernelsu-objs += hook/syscall_hook_manager.o
   kernelsu-objs += hook/syscall_event_bridge.o
-  ifeq (\$(CONFIG_ARM64),y)
+  ifeq ($(CONFIG_ARM64),y)
     kernelsu-objs += hook/arm64/syscall_hook.o
     kernelsu-objs += hook/arm64/patch_memory.o
   endif'''
 
 new_content = content[:block_end] + insertion + '\n' + content[block_end:]
 kbuild_path.write_text(new_content)
-print("✅ Kbuild patché (avec \$ échappé)")
+print("✅ Kbuild patché")
 
-# VÉRIFICATION
 verify = kbuild_path.read_text()
 manual_idx2 = verify.find('else ifdef CONFIG_KSU_MANUAL_HOOK')
 if manual_idx2 >= 0:
@@ -138,10 +138,10 @@ if manual_idx2 >= 0:
     print("=== Bloc MANUAL_HOOK après patch ===")
     print(manual_block2)
     print("=== Fin bloc ===")
-    if 'ifeq (\$(CONFIG_ARM64),y)' in manual_block2:
-        print("✅ \$(CONFIG_ARM64) correctement échappé")
+    if 'ifeq ($(CONFIG_ARM64),y)' in manual_block2:
+        print("✅ $(CONFIG_ARM64) correctement préservé")
     else:
-        print("❌ \$(CONFIG_ARM64) mal échappé — vérification manuelle")
+        print("❌ $(CONFIG_ARM64) mal échappé")
 PYEOF
 
 echo ""
@@ -154,7 +154,7 @@ for f in "$KSU_DIR/hook/syscall_hook.h" "$KSU_DIR/hook/arm64/syscall_hook.c" "$K
     fi
 done
 
-# ==================== 2g. PATCH init.c CORRIGÉ ====================
+# ==================== 2g. PATCH init.c (avec os.environ) ====================
 echo ""
 echo "=== Patch init.c ==="
 
@@ -164,13 +164,18 @@ if [ ! -f "$KSU_INIT" ]; then
 fi
 echo "init.c trouvé : $KSU_INIT"
 
-if [ -f "$KSU_INIT" ]; then
-    python3 << 'PYEOF'
+export KSU_INIT
+python3 << 'PYEOF'
+import os
 from pathlib import Path
-p = Path("$KSU_INIT")
+
+p = Path(os.environ['KSU_INIT'])
+if not p.exists():
+    print(f"❌ init.c introuvable : {p}")
+    exit(1)
+
 content = p.read_text()
 
-# 1. Patch include
 old_include = '''#ifdef CONFIG_KSU_TRACEPOINT_HOOK
 #include "hook/syscall_hook_manager.h"
 #include "hook/syscall_hook.h"
@@ -187,8 +192,10 @@ new_include = '''#if defined(CONFIG_KSU_TRACEPOINT_HOOK) || defined(CONFIG_KSU_M
 if old_include in content:
     content = content.replace(old_include, new_include, 1)
     print("✅ Include patché")
+else:
+    if 'syscall_hook.h' in content:
+        print("[i] Include déjà patché")
 
-# 2. Patch ksu_hook_init
 old_hook_init = '''#elif defined(CONFIG_KSU_MANUAL_HOOK)
 // only lsm hook need call init
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
@@ -205,17 +212,20 @@ new_hook_init = '''#elif defined(CONFIG_KSU_MANUAL_HOOK)
 if old_hook_init in content:
     content = content.replace(old_hook_init, new_hook_init, 1)
     print("✅ ksu_hook_init patché")
+else:
+    if 'ksu_syscall_hook_init' in content:
+        print("[i] ksu_hook_init déjà patché")
 
 p.write_text(content)
 
-# VÉRIFICATION
 verify = p.read_text()
 if 'ksu_syscall_hook_init' in verify:
     print("✅ VÉRIFICATION : ksu_syscall_hook_init présent")
+else:
+    print("❌ VÉRIFICATION : ksu_syscall_hook_init ABSENT")
 PYEOF
-fi
 
-# ==================== 2h. PATCH ksud_integration.c ====================
+# ==================== 2h. PATCH ksud_integration.c (avec os.environ) ====================
 echo ""
 echo "=== Patch ksud_integration.c ==="
 
@@ -225,14 +235,19 @@ if [ ! -f "$KSU_KSUD" ]; then
 fi
 echo "ksud_integration.c trouvé : $KSU_KSUD"
 
-if [ -f "$KSU_KSUD" ]; then
-    python3 << 'PYEOF'
-from pathlib import Path
+export KSU_KSUD
+python3 << 'PYEOF'
+import os
 import re
-p = Path("$KSU_KSUD")
+from pathlib import Path
+
+p = Path(os.environ['KSU_KSUD'])
+if not p.exists():
+    print(f"❌ ksud_integration.c introuvable : {p}")
+    exit(1)
+
 content = p.read_text()
 
-# Patch include
 old_inc = '''#ifdef CONFIG_KSU_TRACEPOINT_HOOK
 #include "hook/syscall_hook.h"
 #endif'''
@@ -242,8 +257,10 @@ new_inc = '''#if defined(CONFIG_KSU_TRACEPOINT_HOOK) || defined(CONFIG_KSU_MANUA
 if old_inc in content:
     content = content.replace(old_inc, new_inc, 1)
     print("✅ Include patché")
+else:
+    if 'syscall_hook.h' in content:
+        print("[i] Include déjà patché")
 
-# Patch ksu_ksud_init
 old_pattern = re.compile(
     r'#ifdef CONFIG_KSU_TRACEPOINT_HOOK\s*\n\s*int ret;',
     re.MULTILINE
@@ -254,11 +271,16 @@ if old_pattern.search(content):
         content, count=1
     )
     print("✅ ksu_ksud_init patché")
+else:
+    if 'defined(CONFIG_KSU_TRACEPOINT_HOOK) || defined(CONFIG_KSU_MANUAL_HOOK)' in content:
+        print("[i] ksu_ksud_init déjà patché")
 
 p.write_text(content)
-print("✅ ksud_integration.c sauvegardé")
+
+verify = p.read_text()
+if 'defined(CONFIG_KSU_TRACEPOINT_HOOK) || defined(CONFIG_KSU_MANUAL_HOOK)' in verify:
+    print("✅ VÉRIFICATION : bloc étendu à MANUAL_HOOK")
 PYEOF
-fi
 
 # ==================== 2b. NETTOYAGE UNICODE ====================
 echo ""
@@ -324,7 +346,6 @@ echo "✅ Static exports terminés"
 # ==================== 3. AUCUN HOOK MANUEL ====================
 echo ""
 echo "=== Aucun hook manuel inséré (syscall table hook activé) ==="
-echo "✅ Les hooks execve/faccessat/stat/reboot seront patchés via sys_call_table"
 
 # ==================== 4. PATCH SUSFS ====================
 echo ""
@@ -388,16 +409,15 @@ PYEOF
 fi
 echo "✅ Corrections terminées"
 
-# ==================== 6. CONFIGURATION CORRIGÉE ====================
+# ==================== 6. CONFIGURATION (MANUAL_HOOK forcé, SUSFS désactivé) ====================
 echo ""
-echo "=== Configuration (MANUAL_HOOK forcé, SUSFS désactivé) ==="
+echo "=== Configuration ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 mkdir -p out
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
-# IMPORTANT: ne PAS activer SUSFS (sinon olddefconfig garde SUSFS au lieu de MANUAL_HOOK)
 {
   echo "CONFIG_KSU=y"
   echo "CONFIG_KSU_MANUAL_HOOK=y"
@@ -411,16 +431,14 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_COMPAT_32BIT_TIME=y"
   echo "# CONFIG_COMPAT_VDSO is not set"
   echo "# CONFIG_VDSO32 is not set"
-  echo "# CONFIG_KSU_SUSFS is not set"    # DÉSACTIVÉ pour forcer MANUAL_HOOK
+  echo "# CONFIG_KSU_SUSFS is not set"
 } >> out/.config
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
-# Forçage MANUAL_HOOK + désactivation SUSFS
 sed -i 's/^# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
 sed -i 's/^CONFIG_KSU_SUSFS=y/# CONFIG_KSU_SUSFS is not set/' out/.config
 
-# Si MANUAL_HOOK n'est pas encore actif
 if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
     echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
 fi
@@ -435,33 +453,23 @@ if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
     exit 1
 fi
 if grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
-    echo "⚠️  CONFIG_KSU_SUSFS est encore actif (devrait être désactivé)"
+    echo "⚠️  CONFIG_KSU_SUSFS est encore actif"
 fi
 echo "✅ MANUAL_HOOK actif"
 
-# ==================== 6b. VÉRIFICATION FINALE Kbuild AVANT COMPILATION ====================
+# ==================== 6b. VÉRIFICATION FINALE Kbuild ====================
 echo ""
-echo "=== VÉRIFICATION FINALE Kbuild (avant compilation) ==="
+echo "=== VÉRIFICATION FINALE Kbuild ==="
 grep -n "syscall_hook" "$KSU_KBUILD" | head -10 || echo "  ❌ syscall_hook ABSENT"
 echo ""
-echo "=== VÉRIFICATION \$(CONFIG_ARM64) dans le Kbuild ==="
+echo "=== VÉRIFICATION \$(CONFIG_ARM64) ==="
 grep -n "CONFIG_ARM64" "$KSU_KBUILD" | head -5
 if grep -q "ifeq (\$(CONFIG_ARM64),y)" "$KSU_KBUILD"; then
-    echo "  ✅ \$(CONFIG_ARM64) correctement échappé"
+    echo "  ✅ \$(CONFIG_ARM64) correctement préservé"
 else
-    echo "  ❌ \$(CONFIG_ARM64) mal échappé (ifeq (,y) ou similaire)"
+    echo "  ❌ \$(CONFIG_ARM64) mal échappé"
     grep -n "ifeq (,y)" "$KSU_KBUILD" || true
 fi
-
-echo ""
-echo "=== VÉRIFICATION syscall_hook.c (fichiers source) ==="
-for f in "$KSU_DIR/hook/syscall_hook.h" "$KSU_DIR/hook/arm64/syscall_hook.c" "$KSU_DIR/hook/syscall_hook_manager.c" "$KSU_DIR/hook/syscall_event_bridge.c" "$KSU_DIR/hook/arm64/patch_memory.c"; do
-    if [ -f "$f" ]; then
-        echo "  ✅ $f"
-    else
-        echo "  ❌ $f ABSENT"
-    fi
-done
 
 # ==================== 7. PATCHS MOTOROLA ====================
 echo "=== Patch signatures + tactile ==="
@@ -494,7 +502,7 @@ gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1
 if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
     echo "❌ boot-stock invalide"; exit 1
 fi
-gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -o dtbo-stock.img 2>&1 || true
+gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 || true
 
 mkdir -p repack; cp boot-stock.img repack/boot.img
 wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O Magisk-v27.0.apk
@@ -527,9 +535,9 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SyscallTable-v9.2-boot.img
+cp final_boot.img output/BakaSU-SyscallTable-v9.3-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 echo ""
-echo "=== BUILD TERMINÉ v9.2 ==="
+echo "=== BUILD TERMINÉ v9.3 ==="
 ls -lh output/
