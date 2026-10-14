@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-ALBANEL-V4 : Static exports SELinux + hooks doc officielle
+# BRANCHE TEST-ALBANEL-V5 : Fix symbol_resolver.h + Static exports SELinux
 # Source : Albanel22/ReSukiSU (fork intact d'août 2026, v4.2.0-rc1)
 # Mode : MANUAL_HOOK seul (SUSFS désactivé)
 # =============================================================================
@@ -101,6 +101,27 @@ else
     echo "  ✅ Aucun Unicode restant détecté"
 fi
 
+# ==================== 2c. FIX symbol_resolver.h ====================
+echo ""
+echo "=== Fix symbol_resolver.h (conflit static inline) ==="
+
+if [ -f "$KSU_DIR/kernel/infra/symbol_resolver.h" ]; then
+    # Commenter les 3 lignes static inline qui causent le conflit
+    sed -i 's|^static inline void \*ksu_resolve_symbol_for_functable_hook|// static inline void *ksu_resolve_symbol_for_functable_hook|' "$KSU_DIR/kernel/infra/symbol_resolver.h"
+    sed -i 's|^static inline unsigned long find_kernel_symbol_exact|// static inline unsigned long find_kernel_symbol_exact|' "$KSU_DIR/kernel/infra/symbol_resolver.h"
+    sed -i 's|^static inline void ksu_init_symbol_resolver|// static inline void ksu_init_symbol_resolver|' "$KSU_DIR/kernel/infra/symbol_resolver.h"
+    echo "  ✅ 3 lignes static inline commentées"
+
+    # Vérification
+    if grep -q "^// static inline" "$KSU_DIR/kernel/infra/symbol_resolver.h"; then
+        echo "  ✅ Fix confirmé"
+    else
+        echo "  ⚠️  Fix non confirmé — vérification manuelle"
+    fi
+else
+    echo "  ⚠️  symbol_resolver.h introuvable"
+fi
+
 # ==================== 3. STATIC EXPORTS SELINUX ====================
 echo ""
 echo "=== Static exports SELinux (doc officielle ReSukiSU) ==="
@@ -110,9 +131,6 @@ if [ -f "security/selinux/selinuxfs.c" ]; then
     if grep -q "^static ssize_t (\*write_op\[\])" security/selinux/selinuxfs.c; then
         sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
         echo "  ✅ write_op exporté"
-    elif grep -q "^static ssize_t (\*write_op\[\])(struct file \*, char \*, size_t)" security/selinux/selinuxfs.c; then
-        sed -i 's/^static ssize_t (\*write_op\[\])(struct file \*, char \*, size_t)/ssize_t (*write_op[])(struct file *, char *, size_t)/' security/selinux/selinuxfs.c
-        echo "  ✅ write_op exporté (variante)"
     else
         echo "  ⚠️  write_op non trouvé ou déjà exporté"
     fi
@@ -401,7 +419,7 @@ PYEOF
   python3 /tmp/h_setresuid.py
 fi
 
-# --- Hook 8 : sys_read (géré par AUTO_INITRC_HOOK, mais on l'ajoute en sécurité) ---
+# --- Hook 8 : sys_read ---
 if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
   cat > /tmp/h_read.py << 'PYEOF'
 import re
@@ -629,8 +647,7 @@ if [ -f "kernel" ]; then
         else
             echo "  ❌ '$sym' ABSENT"
         fi
-    done
-fi
+    donefi
 cd ..
 
 # ==================== 10. SORTIE ====================
@@ -639,9 +656,10 @@ cp final_boot.img output/ReSukiSU-Albanel-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ (test-albanel-v4) ==="
+echo "=== BUILD TERMINÉ (test-albanel-v5) ==="
 echo "Source : Albanel22/ReSukiSU"
 echo "Mode : MANUAL_HOOK seul (SUSFS désactivé)"
 echo "Static exports SELinux : activés"
+echo "Fix symbol_resolver.h : activé"
 echo "Nettoyage Unicode : activé"
 ls -lh output/
