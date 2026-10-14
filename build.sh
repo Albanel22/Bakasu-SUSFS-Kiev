@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-ALBANEL-V5 : Fix symbol_resolver.h + Static exports SELinux
+# BRANCHE TEST-ALBANEL-V5.1 : Fix syntaxe ligne 666
 # Source : Albanel22/ReSukiSU (fork intact d'août 2026, v4.2.0-rc1)
 # Mode : MANUAL_HOOK seul (SUSFS désactivé)
 # =============================================================================
@@ -106,13 +106,11 @@ echo ""
 echo "=== Fix symbol_resolver.h (conflit static inline) ==="
 
 if [ -f "$KSU_DIR/kernel/infra/symbol_resolver.h" ]; then
-    # Commenter les 3 lignes static inline qui causent le conflit
     sed -i 's|^static inline void \*ksu_resolve_symbol_for_functable_hook|// static inline void *ksu_resolve_symbol_for_functable_hook|' "$KSU_DIR/kernel/infra/symbol_resolver.h"
     sed -i 's|^static inline unsigned long find_kernel_symbol_exact|// static inline unsigned long find_kernel_symbol_exact|' "$KSU_DIR/kernel/infra/symbol_resolver.h"
     sed -i 's|^static inline void ksu_init_symbol_resolver|// static inline void ksu_init_symbol_resolver|' "$KSU_DIR/kernel/infra/symbol_resolver.h"
     echo "  ✅ 3 lignes static inline commentées"
 
-    # Vérification
     if grep -q "^// static inline" "$KSU_DIR/kernel/infra/symbol_resolver.h"; then
         echo "  ✅ Fix confirmé"
     else
@@ -647,7 +645,8 @@ if [ -f "kernel" ]; then
         else
             echo "  ❌ '$sym' ABSENT"
         fi
-    donefi
+    done
+fi
 cd ..
 
 # ==================== 10. SORTIE ====================
@@ -656,7 +655,7 @@ cp final_boot.img output/ReSukiSU-Albanel-boot.img 2>/dev/null || true
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ (test-albanel-v5) ==="
+echo "=== BUILD TERMINÉ (test-albanel-v5.1) ==="
 echo "Source : Albanel22/ReSukiSU"
 echo "Mode : MANUAL_HOOK seul (SUSFS désactivé)"
 echo "Static exports SELinux : activés"
