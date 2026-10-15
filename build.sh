@@ -279,7 +279,7 @@ cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 
-# 2. Configuration correcte de la toolchain nightly (SANS le -y invalide)
+# 2. Configuration correcte de la toolchain nightly
 rustup toolchain install nightly
 rustup default nightly
 rustup target add aarch64-linux-android
@@ -289,26 +289,33 @@ wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
 unzip -q android-ndk-r26d-linux.zip
 
 export ANDROID_NDK_ROOT="$GITHUB_WORKSPACE/android-ndk-r26d"
-export AARCH64_CLANG_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+export NDK_BIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+# 4. Variables d'environnement EXPLICITES pour CC et CXX (C'est la clé !)
+export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
+export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang++"
+export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 
-# 4. Récupération des sources BakaSU
+# 5. Récupération des sources BakaSU
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
 git clone --depth=1 https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 
-# 5. Configuration Cargo pour le cross-compiling
+# 6. Configuration Cargo pour le cross-compiling
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
 [target.aarch64-linux-android]
-linker = "$AARCH64_CLANG_PATH"
+linker = "$NDK_BIN/aarch64-linux-android26-clang"
 
 [env]
-CC_aarch64_linux_android = "$AARCH64_CLANG_PATH"
+CC_aarch64_linux_android = "$NDK_BIN/aarch64-linux-android26-clang"
+CXX_aarch64_linux_android = "$NDK_BIN/aarch64-linux-android26-clang++"
+AR_aarch64_linux_android = "$NDK_BIN/llvm-ar"
 BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"
 EOF
 
-# 6. Compilation avec gestion d'erreur claire
+# 7. Compilation avec gestion d'erreur claire
 echo "→ Lancement de cargo build..."
 if ! cargo build --release --target aarch64-linux-android; then
     echo "❌ Échec de la compilation de ksud"
