@@ -274,11 +274,17 @@ fi
 # ==================== 9. COMPILATION KSUD ====================
 echo "=== Compilation ksud ==="
 cd "$GITHUB_WORKSPACE"
+
+# 1. Installation propre de Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustup default nightly -y 2>/dev/null || true
-rustup target add aarch64-linux-android 2>/dev/null || true
 
+# 2. Configuration correcte de la toolchain nightly (SANS le -y invalide)
+rustup toolchain install nightly
+rustup default nightly
+rustup target add aarch64-linux-android
+
+# 3. Téléchargement du NDK
 wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
 unzip -q android-ndk-r26d-linux.zip
 
@@ -286,24 +292,37 @@ export ANDROID_NDK_ROOT="$GITHUB_WORKSPACE/android-ndk-r26d"
 export AARCH64_CLANG_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 
+# 4. Récupération des sources BakaSU
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
 git clone --depth=1 https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 
+# 5. Configuration Cargo pour le cross-compiling
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
 [target.aarch64-linux-android]
 linker = "$AARCH64_CLANG_PATH"
+
 [env]
 CC_aarch64_linux_android = "$AARCH64_CLANG_PATH"
 BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"
 EOF
 
-cargo +nightly build --release --target aarch64-linux-android 2>&1 | tail -5
+# 6. Compilation avec gestion d'erreur claire
+echo "→ Lancement de cargo build..."
+if ! cargo build --release --target aarch64-linux-android; then
+    echo "❌ Échec de la compilation de ksud"
+    exit 1
+fi
+
 KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1)
-[ -z "$KSUD_BINARY" ] && { echo "❌ ksud introuvable"; exit 1; }
+if [ -z "$KSUD_BINARY" ]; then
+    echo "❌ ksud introuvable"
+    exit 1
+fi
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
 chmod 755 "$GITHUB_WORKSPACE/ksud"
+echo "✅ ksud compilé : $(du -h $GITHUB_WORKSPACE/ksud | cut -f1)"
 
 # ==================== 10. REPACK VÉRIFIÉ ====================
 echo "=== Repack avec vérifications ==="
