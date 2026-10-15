@@ -543,7 +543,9 @@ fi
 # Vérifier que le ramdisk contient ksud
 mkdir -p ramdisk_check
 cd ramdisk_check
-../magiskboot cpio ../ramdisk.cpio extract 2>/dev/null
+# Chemin corrigé : on remonte de 2 niveaux pour atteindre le dossier repack
+../../repack/magiskboot cpio ../../repack/ramdisk.cpio extract 2>/dev/null || true
+
 if [ -f "system/bin/ksud" ]; then
     echo "✅ ksud présent dans /system/bin/ du ramdisk"
     ls -la system/bin/ksud
@@ -559,6 +561,12 @@ for p in "init.rc" "system/etc/init/hw/init.rc" "system/etc/init/init.rc"; do
         break
     fi
 done
+
+# Fallback si on l'a créé à la racine
+if [ -z "$INITRC_CHECK" ] && [ -f "init.rc" ]; then
+    INITRC_CHECK="init.rc"
+fi
+
 if [ -n "$INITRC_CHECK" ]; then
     if grep -q "KSUD START" "$INITRC_CHECK"; then
         echo "✅ Script KSUD présent dans $INITRC_CHECK"
@@ -568,8 +576,9 @@ if [ -n "$INITRC_CHECK" ]; then
 else
     echo "❌ init.rc introuvable dans le ramdisk"
 fi
-cd ..
-cd ..
+
+# Retour au dossier racine du workspace
+cd ../..
 
 # ==================== 12. SORTIE ====================
 mkdir -p output
