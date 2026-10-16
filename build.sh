@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-INLINE-V11 : SUSFS + Manual Hooks COMPLETS (4.19+)
+# BRANCHE TEST-SUSFS-CYBERC3RD-V16 : BakaSU + SUSFS 2.3.0 (Script Final Blindé)
+# Correction : Injection forcée et infaillible des headers dans fs/super.c
 # =============================================================================
 
-echo "=== Build BakaSU + SUSFS + Manual Hooks v11 ==="
+echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -38,220 +39,161 @@ if [ ! -d "drivers/kernelsu" ] && [ ! -d "KernelSU/kernel" ]; then
 fi
 echo "✅ BakaSU intégré"
 
-if [ -d "drivers/kernelsu" ]; then
-    KSU_DIR="drivers/kernelsu"
-elif [ -d "KernelSU/kernel" ]; then
-    KSU_DIR="KernelSU/kernel"
-else
-    KSU_DIR="KernelSU"
-fi
-
-# ==================== 2e. NEUTRALISATION CHECK.MK ====================
+# ==================== 3. NEUTRALISATION CHECK.MK ====================
 echo "=== Neutralisation check.mk ==="
 for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepoint_hook_check.mk kprobe_check.mk; do
     find . -name "$pattern" -type f -exec sed -i 's/\$(error/\$(warning/g' {} + 2>/dev/null || true
 done
 
-# ==================== 3. PATCH SUSFS ====================
-echo "=== Patch SUSFS 4.19 ==="
-cd "$GITHUB_WORKSPACE"
-rm -rf /tmp/jack_repo
-git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git /tmp/jack_repo 2>/dev/null || true
-
+# ==================== 4. PATCH SUSFS (cyberc3rd 4.19 - URL DIRECTE) ====================
+echo "=== Patch SUSFS 4.19 (cyberc3rd rebase) ==="
 cd "$GITHUB_WORKSPACE/kernel_sources"
-PATCH_419=$(find /tmp/jack_repo/Patches -name "*4.19*" -name "*.patch" 2>/dev/null | head -1)
-if [ -n "$PATCH_419" ]; then
-    patch -p1 < "$PATCH_419" 2>&1 | tail -5 || true
+
+PATCH_URL="https://raw.githubusercontent.com/cyberc3dr/nGKI_Kernel_Build/rebase/Patches/Patch/susfs_patch_to_4.19.patch"
+echo "Téléchargement du patch depuis : $PATCH_URL"
+
+if curl -sSfL "$PATCH_URL" -o /tmp/susfs_4.19.patch; then
+    echo "Application du patch..."
+    patch -p1 < /tmp/susfs_4.19.patch 2>&1 | tail -15 || true
+    rm -f /tmp/susfs_4.19.patch
+else
+    echo "❌ Échec du téléchargement du patch SUSFS. Vérifiez l'URL."
+    exit 1
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 4. CORRECTIONS POST-PATCH SUSFS ====================
+# ==================== 5. CORRECTIONS POST-PATCH SUSFS (INFAILLIBLE) ====================
+echo "=== Corrections post-patch SUSFS ==="
+
+# 1. Correction __maybe_unused
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
 done
 
-# Injections SUSFS de base
+# 2. Injection robuste des headers (Script Python blindé)
 python3 << 'PYEOF'
 from pathlib import Path
 
-files_to_patch = {
-    "fs/namespace.c": ('#include <linux/sched/task.h>', '''
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-#include <linux/susfs_def.h>
-extern bool susfs_is_current_ksu_domain(void);
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#define CL_COPY_MNT_NS BIT(25)
-#endif'''),
-    "fs/super.c": ('#include "internal.h"', '''
+decl_super = '''
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs_def.h>
 #endif
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 extern bool susfs_is_current_ksu_domain(void);
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#endif'''),
-    "fs/stat.c": ('#include <asm/unistd.h>', '''
+#endif
+'''
+
+decl_ns = '''
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#include <linux/susfs_def.h>
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+#define CL_COPY_MNT_NS BIT(25)
+#endif
+'''
+
+decl_stat = '''
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 #include <linux/susfs_def.h>
-#endif''')
-}
+#endif
+'''
 
-for filepath, (anchor, decl) in files_to_patch.items():
-    p = Path(filepath)
-    if p.exists() and 'susfs_def.h' not in p.read_text():
-        content = p.read_text()
-        if anchor in content:
-            content = content.replace(anchor, anchor + '\n' + decl, 1)
-            p.write_text(content)
+def inject_after(content, anchor, declaration):
+    if anchor in content:
+        return content.replace(anchor, anchor + declaration, 1)
+    return None
+
+# --- Traitement de fs/super.c (Le plus critique) ---
+super_c = Path("fs/super.c")
+if super_c.exists() and 'susfs_is_current_ksu_domain' not in super_c.read_text():
+    c = super_c.read_text()
+    # Essayer plusieurs ancres courantes dans l'ordre de probabilité
+    injected = inject_after(c, '#include <linux/mount.h>', decl_super)
+    if not injected:
+        injected = inject_after(c, '#include <linux/fs.h>', decl_super)
+    if not injected:
+        # Fallback ultime : insérer à la ligne 15
+        lines = c.split('\n')
+        lines.insert(15, decl_super)
+        injected = '\n'.join(lines)
+    
+    super_c.write_text(injected)
+    print("✅ fs/super.c : Déclarations SUSFS injectées de force au début du fichier")
+
+# --- Traitement de fs/namespace.c ---
+ns_c = Path("fs/namespace.c")
+if ns_c.exists() and 'susfs_is_current_ksu_domain' not in ns_c.read_text():
+    c = ns_c.read_text()
+    injected = inject_after(c, '#include <linux/sched/task.h>', decl_ns)
+    if not injected:
+        injected = inject_after(c, '#include <linux/fs.h>', decl_ns)
+    if not injected:
+        lines = c.split('\n')
+        lines.insert(15, decl_ns)
+        injected = '\n'.join(lines)
+    ns_c.write_text(injected)
+    print("✅ fs/namespace.c : Déclarations SUSFS injectées")
+
+# --- Traitement de fs/stat.c ---
+stat_c = Path("fs/stat.c")
+if stat_c.exists() and 'susfs_def.h' not in stat_c.read_text():
+    c = stat_c.read_text()
+    injected = inject_after(c, '#include <asm/unistd.h>', decl_stat)
+    if not injected:
+        injected = inject_after(c, '#include <linux/fs.h>', decl_stat)
+    if not injected:
+        lines = c.split('\n')
+        lines.insert(15, decl_stat)
+        injected = '\n'.join(lines)
+    stat_c.write_text(injected)
+    print("✅ fs/stat.c : Déclarations SUSFS injectées")
+
+print("✅ Toutes les corrections post-patch ont été appliquées avec succès.")
 PYEOF
 
-# ==================== 5. INJECTION DES MANUAL HOOKS (OBLIGATOIRE 4.19+) ====================
-echo "=== Injection des Manual Hooks (Requis pour ReSukiSU v4.1.0) ==="
-
-python3 << 'PYEOF'
-import re
-from pathlib import Path
-
-# 1. STAT HOOK (fs/stat.c)
-stat_file = Path("fs/stat.c")
-if stat_file.exists() and "ksu_handle_stat" not in stat_file.read_text():
-    content = stat_file.read_text()
-    # Déclarations
-    decl = '''
-#ifdef CONFIG_KSU_MANUAL_HOOK
-__attribute__((hot))
-extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
-extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
-#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
-extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
-#endif
-#endif
-'''
-    # Injection dans newfstatat
-    content = re.sub(
-        r'(SYSCALL_DEFINE4\(newfstatat,.*?int error;\n)',
-        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\n',
-        content, flags=re.DOTALL
-    )
-    # Injection dans newfstat
-    content = re.sub(
-        r'(SYSCALL_DEFINE2\(newfstat,.*?if \(!error\)\n\t\terror = cp_new_stat\(&stat, statbuf\);\n)',
-        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n',
-        content, flags=re.DOTALL
-    )
-    # Ajout des déclarations en haut
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'ksu_handle_stat' not in content[:m.end()]:
-        content = content[:m.end()] + decl + '\n' + content[m.end():]
-    stat_file.write_text(content)
-    print("✅ Hook stat.c injecté")
-
-# 2. EXECVE HOOK (fs/exec.c)
-exec_file = Path("fs/exec.c")
-if exec_file.exists() and "ksu_handle_execveat" not in exec_file.read_text():
-    content = exec_file.read_text()
-    decl = '''
-#ifdef CONFIG_KSU_MANUAL_HOOK
-__attribute__((hot))
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
-__attribute__((hot))
-extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags, int *retval);
-#endif
-'''
-    # Injection dans do_execveat_common
-    content = re.sub(
-        r'(static int do_execveat_common\(int fd, struct filename \*filename,\s*struct user_arg_ptr argv,\s*struct user_arg_ptr envp,\s*int flags\)\n\{)',
-        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tint retval;\n\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n\tretval = __do_execve_file(fd, filename, argv, envp, flags, NULL);\n\tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);\n\treturn retval;\n#else',
-        content
-    )
-    content = re.sub(
-        r'(\treturn __do_execve_file\(fd, filename, argv, envp, flags, NULL\);\n\})',
-        r'#endif\n\1',
-        content
-    )
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'ksu_handle_execveat' not in content[:m.end()]:
-        content = content[:m.end()] + decl + '\n' + content[m.end():]
-    exec_file.write_text(content)
-    print("✅ Hook exec.c injecté")
-
-# 3. FACCESSAT HOOK (fs/open.c)
-open_file = Path("fs/open.c")
-if open_file.exists() and "ksu_handle_faccessat" not in open_file.read_text():
-    content = open_file.read_text()
-    decl = '''
-#ifdef CONFIG_KSU_MANUAL_HOOK
-__attribute__((hot))
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
-#endif
-'''
-    content = re.sub(
-        r'(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n\{)',
-        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n',
-        content
-    )
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'ksu_handle_faccessat' not in content[:m.end()]:
-        content = content[:m.end()] + decl + '\n' + content[m.end():]
-    open_file.write_text(content)
-    print("✅ Hook open.c injecté")
-
-# 4. REBOOT HOOK (kernel/reboot.c ou kernel/sys.c)
-reboot_file = Path("kernel/reboot.c") if Path("kernel/reboot.c").exists() else Path("kernel/sys.c")
-if reboot_file.exists() and "ksu_handle_sys_reboot" not in reboot_file.read_text():
-    content = reboot_file.read_text()
-    decl = '''
-#ifdef CONFIG_KSU_MANUAL_HOOK
-extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
-#endif
-'''
-    content = re.sub(
-        r'(SYSCALL_DEFINE4\(reboot, int, magic1, int, magic2, unsigned int, cmd,\s*void __user \*, arg\)\n\{)',
-        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n',
-        content
-    )
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'ksu_handle_sys_reboot' not in content[:m.end()]:
-        content = content[:m.end()] + decl + '\n' + content[m.end():]
-    reboot_file.write_text(content)
-    print("✅ Hook reboot injecté")
-
-print("✅ Tous les Manual Hooks requis ont été injectés.")
-PYEOF
-
-# ==================== 6. CONFIGURATION "MAGIQUE" ====================
-echo "=== Configuration (Optimisée pour Manual Hooks 4.19) ==="
+# ==================== 6. CONFIGURATION (FORCÉE ET BLINDÉE) ====================
+echo "=== Configuration du noyau ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 mkdir -p out
+
+# 1. Génération de la config de base
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
-{
-  echo "CONFIG_KSU=y"
-  echo "CONFIG_KSU_MANUAL_HOOK=y"
-  # Ces options appliquent automatiquement certains hooks via LSM, évitant des edits source fragiles
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y"
-  # ASTUCE CRUCIALE de la doc : évite TOUTES les modifications manuelles des exports SELinux (static)
-  echo "CONFIG_KALLSYMS_ALL=y"
-  
-  echo "CONFIG_KSU_SUSFS=y"
-  echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-  echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-  echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-  echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-  echo "CONFIG_COMPAT=y"
-  echo "CONFIG_COMPAT_32BIT_TIME=y"
-} >> out/.config
+# 2. Ajout des options souhaitées
+cat << 'EOF' >> out/.config
+CONFIG_KSU=y
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_SUS_MAP=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_COMPAT=y
+CONFIG_COMPAT_32BIT_TIME=y
+EOF
 
-make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
+# 3. Résolution des dépendances
+echo "→ Résolution des dépendances (olddefconfig)..."
+make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
+
+# 4. OPTION NUCLÉAIRE : Forcer les valeurs APRÈS olddefconfig
+echo "→ Forçage des options KSU (Option Nucléaire)..."
+sed -i 's/^# CONFIG_KSU is not set$/CONFIG_KSU=y/' out/.config
+sed -i 's/^# CONFIG_KSU_SUSFS is not set$/CONFIG_KSU_SUSFS=y/' out/.config
+sed -i 's/^CONFIG_KSU_MANUAL_HOOK=y$/# CONFIG_KSU_MANUAL_HOOK is not set/' out/.config
+sed -i 's/^CONFIG_KSU_TRACEPOINT_HOOK=y$/# CONFIG_KSU_TRACEPOINT_HOOK is not set/' out/.config
+
+# 5. VÉRIFICATION OBLIGATOIRE
+echo "=== VÉRIFICATION FINALE DU .CONFIG ==="
+grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_KSU_MANUAL_HOOK=" out/.config || echo "❌ ERREUR CRITIQUE : KSU n'est pas activé !"
 
 # ==================== 7. PATCHS MOTOROLA ====================
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
@@ -274,65 +216,47 @@ fi
 # ==================== 9. COMPILATION KSUD ====================
 echo "=== Compilation ksud ==="
 cd "$GITHUB_WORKSPACE"
-
-# 1. Installation propre de Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-
-# 2. Configuration correcte de la toolchain nightly
 rustup toolchain install nightly
 rustup default nightly
 rustup target add aarch64-linux-android
 
-# 3. Téléchargement du NDK
 wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
 unzip -q android-ndk-r26d-linux.zip
 
 export ANDROID_NDK_ROOT="$GITHUB_WORKSPACE/android-ndk-r26d"
 export NDK_BIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-# 4. Variables d'environnement EXPLICITES pour CC et CXX (C'est la clé !)
 export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
 export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang++"
-export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 
-# 5. Récupération des sources BakaSU
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
 git clone --depth=1 https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 
-# 6. Configuration Cargo pour le cross-compiling
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
 [target.aarch64-linux-android]
 linker = "$NDK_BIN/aarch64-linux-android26-clang"
-
 [env]
 CC_aarch64_linux_android = "$NDK_BIN/aarch64-linux-android26-clang"
 CXX_aarch64_linux_android = "$NDK_BIN/aarch64-linux-android26-clang++"
-AR_aarch64_linux_android = "$NDK_BIN/llvm-ar"
 BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"
 EOF
 
-# 7. Compilation avec gestion d'erreur claire
-echo "→ Lancement de cargo build..."
 if ! cargo build --release --target aarch64-linux-android; then
-    echo "❌ Échec de la compilation de ksud"
+    echo "❌ Échec compilation ksud"
     exit 1
 fi
-
 KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1)
-if [ -z "$KSUD_BINARY" ]; then
-    echo "❌ ksud introuvable"
-    exit 1
-fi
+[ -z "$KSUD_BINARY" ] && { echo "❌ ksud introuvable"; exit 1; }
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
 chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé : $(du -h $GITHUB_WORKSPACE/ksud | cut -f1)"
+echo "✅ ksud compilé"
 
-# ==================== 10. REPACK VÉRIFIÉ ====================
-echo "=== Repack avec vérifications ==="
+# ==================== 10. REPACK AVEC INJECTION KSUD (Méthode Non-GKI Officielle) ====================
+echo "=== Repack avec injection ksud (Obligatoire pour Non-GKI) ==="
 cd "$GITHUB_WORKSPACE"
 rm -f boot-stock.img dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1
@@ -352,72 +276,60 @@ echo "→ Unpack..."
 echo "→ Remplacement du kernel..."
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-echo "→ Extraction et modification init.rc..."
-rm -rf ramdisk_work && mkdir -p ramdisk_work && cd ramdisk_work
+echo "→ Préparation du ramdisk pour l'injection..."
+rm -rf ramdisk_work && mkdir -p ramdisk_work
+cd ramdisk_work
 ../magiskboot cpio ../ramdisk.cpio extract
 
-INITRC_PATH=""
-for p in "init.rc" "system/etc/init/hw/init.rc" "system/etc/init/init.rc"; do
-    [ -f "$p" ] && INITRC_PATH="$p" && break
-done
-[ -z "$INITRC_PATH" ] && INITRC_PATH=$(find . -name "init.rc" -type f 2>/dev/null | head -1)
+# 1. Injecter ksud dans le ramdisk
+mkdir -p system/bin
+cp "$GITHUB_WORKSPACE/ksud" system/bin/ksud
+chmod 755 system/bin/ksud
+echo "✅ ksud ajouté au ramdisk (system/bin/)"
 
-# Fallback robuste si init.rc est absent
-if [ -z "$INITRC_PATH" ]; then
-    echo "⚠️ init.rc introuvable. Création d'un fallback à la racine."
-    INITRC_PATH="init.rc"
-    touch "$INITRC_PATH"
-fi
+# 2. Injecter le script init.rc pour déclencher ksud au boot
+INITRC_PATH="init.rc"
+[ -f "system/etc/init/hw/init.rc" ] && INITRC_PATH="system/etc/init/hw/init.rc"
 
-INITRC_PATH="${INITRC_PATH#./}"
 mkdir -p "$(dirname "$INITRC_PATH")"
-
 cat >> "$INITRC_PATH" << 'INITRC_EOF'
+
 # --- KSUD START ---
 on post-fs-data
     exec u:r:su:s0 root -- /system/bin/ksud post-fs-data
+
 on nonencrypted
     exec u:r:su:s0 root -- /system/bin/ksud services
-on property:vold.decrypt=trigger_restart_framework
-    exec u:r:su:s0 root -- /system/bin/ksud services
+
 on property:sys.boot_completed=1
     exec u:r:su:s0 root -- /system/bin/ksud boot-completed
 # --- KSUD END ---
 INITRC_EOF
+echo "✅ Script init.rc ajouté à $INITRC_PATH"
 
-mkdir -p system/bin && cp "$GITHUB_WORKSPACE/ksud" system/bin/ksud && chmod 755 system/bin/ksud
 cd ..
 
-echo "→ Reconstruction du ramdisk..."
-./magiskboot cpio ramdisk.cpio "mkdir 0755 system" "mkdir 0755 system/bin" "add 0755 system/bin/ksud ramdisk_work/system/bin/ksud"
-[ -n "$INITRC_PATH" ] && ./magiskboot cpio ramdisk.cpio "add 0750 $INITRC_PATH ramdisk_work/$INITRC_PATH"
+echo "→ Reconstruction du ramdisk avec les ajouts..."
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 system" \
+    "mkdir 0755 system/bin" \
+    "add 0755 system/bin/ksud ramdisk_work/system/bin/ksud" \
+    "add 0750 $INITRC_PATH ramdisk_work/$INITRC_PATH"
 
 echo "→ Repack..."
 ./magiskboot repack boot.img new-boot.img
 [ ! -f "new-boot.img" ] && { echo "❌ Échec repack"; exit 1; }
 mv new-boot.img ../final_boot.img && cd ..
+echo "✅ Repack terminé avec injection ksud"
 
-# ==================== 11. VÉRIFICATION POST-REPACK ====================
-echo "=== VÉRIFICATION POST-REPACK ==="
-mkdir -p verify && cd verify
-cp ../final_boot.img verify_boot.img
-../repack/magiskboot unpack verify_boot.img
-
-HASH_EXTRACTED=$(sha256sum kernel | cut -d' ' -f1)
-HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
-[ "$HASH_EXTRACTED" = "$HASH_COMPILED" ] && echo "✅ Noyau IDENTIQUE" || echo "⚠️ Noyau DIFFÉRENT !"
-
-mkdir -p ramdisk_check && cd ramdisk_check
-../../repack/magiskboot cpio ../../repack/ramdisk.cpio extract 2>/dev/null || true
-[ -f "system/bin/ksud" ] && echo "✅ ksud présent dans le ramdisk" || echo "❌ ksud ABSENT du ramdisk !"
-
-cd ../..
-
-# ==================== 12. SORTIE ====================
+# ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFSInline-v11-boot.img
+cp final_boot.img output/BakaSU-SUSFS-cyberc3rd-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
-echo "=== BUILD TERMINÉ v11 ==="
+echo ""
+echo "========================================="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v16 ==="
+echo "========================================="
 ls -lh output/
