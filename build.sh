@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V18 : BakaSU + SUSFS 2.3.0 (Script "Marteau-Piqueur")
-# Correction : Injection garantie via sed (plus de Python fragile pour super.c)
+# BRANCHE TEST-SUSFS-CYBERC3RD-V21 : Injection Chirurgicale (Ligne 41)
+# Basé sur l'information précise : includes de la ligne 24 à 40, ligne 41 vide.
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -23,7 +23,9 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE ====================
+# ==================== 1. CLONAGE (NETTOYAGE FORCÉ) ====================
+echo "=== Nettoyage et clonage ==="
+rm -rf kernel_sources
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 git log --oneline -1
@@ -62,62 +64,51 @@ else
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS POST-PATCH SUSFS (SED MARTHEAU-PIQUEUR) ====================
-echo "=== Corrections post-patch SUSFS (Injection forcée) ==="
+# ==================== 5. CORRECTIONS POST-PATCH (INJECTION CHIRURGICALE) ====================
+echo "=== Corrections post-patch SUSFS ==="
 
 # 1. Correction __maybe_unused
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
 done
 
-# 2. Injection GARANTIE dans fs/super.c via sed
-if ! grep -q "susfs_is_current_ksu_domain" fs/super.c; then
-    echo "⚠️ fs/super.c : Déclarations manquantes, injection via sed..."
-    if grep -q '#include "internal.h"' fs/super.c; then
-        sed -i '/#include "internal.h"/a\
-#ifdef CONFIG_KSU_SUSFS\
-#include <linux/susfs_def.h>\
-#endif\
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
-extern bool susfs_is_current_ksu_domain(void);\
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
-#endif' fs/super.c
-    else
-        # Fallback ultime : ligne 26 (juste après les commentaires de licence)
-        sed -i '26a\
-#ifdef CONFIG_KSU_SUSFS\
-#include <linux/susfs_def.h>\
-#endif\
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
-extern bool susfs_is_current_ksu_domain(void);\
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
-#endif' fs/super.c
-    fi
-    echo "✅ fs/super.c corrigé avec succès"
-else
-    echo "✅ fs/super.c : Déclarations déjà présentes"
-fi
+# 2. NETTOYAGE RADICAL de fs/super.c (On efface TOUTE trace de SUSFS pour repartir à zéro)
+echo "→ Nettoyage radical de fs/super.c..."
+sed -i '/susfs_is_current_ksu_domain/d' fs/super.c
+sed -i '/susfs_is_sdcard_android_data_not_decrypted/d' fs/super.c
+sed -i '/#include <linux\/susfs_def.h>/d' fs/super.c
+sed -i '/^#ifdef CONFIG_KSU_SUSFS$/d' fs/super.c
+sed -i '/^#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT$/d' fs/super.c
+sed -i '/^#endif.*CONFIG_KSU_SUSFS/d' fs/super.c
 
-# 3. Injection dans fs/namespace.c
-if ! grep -q "susfs_is_current_ksu_domain" fs/namespace.c; then
-    sed -i '/#include <linux\/sched\/task.h>/a\
+# 3. INJECTION CHIRURGICALE à la ligne 41 (juste après le dernier #include)
+echo "→ Injection des déclarations SUSFS à la ligne 41 de fs/super.c..."
+sed -i '40a\
+#ifdef CONFIG_KSU_SUSFS\
+#include <linux/susfs_def.h>\
+#endif\
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
+extern bool susfs_is_current_ksu_domain(void);\
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
+#endif' fs/super.c
+echo "✅ fs/super.c : Déclarations injectées avec succès après la ligne 40"
+
+# 4. Injection dans fs/namespace.c
+sed -i '/#include <linux\/sched\/task.h>/a\
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
 #include <linux/susfs_def.h>\
 extern bool susfs_is_current_ksu_domain(void);\
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
 #define CL_COPY_MNT_NS BIT(25)\
 #endif' fs/namespace.c 2>/dev/null || true
-    echo "✅ fs/namespace.c corrigé"
-fi
+echo "✅ fs/namespace.c corrigé"
 
-# 4. Injection dans fs/stat.c
-if ! grep -q "susfs_def.h" fs/stat.c; then
-    sed -i '/#include <asm\/unistd.h>/a\
+# 5. Injection dans fs/stat.c
+sed -i '/#include <asm\/unistd.h>/a\
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\
 #include <linux/susfs_def.h>\
 #endif' fs/stat.c 2>/dev/null || true
-    echo "✅ fs/stat.c corrigé"
-fi
+echo "✅ fs/stat.c corrigé"
 
 # ==================== 6. CONFIGURATION (FORCÉE ET BLINDÉE) ====================
 echo "=== Configuration du noyau ==="
@@ -290,6 +281,6 @@ cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v18 ==="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v21 ==="
 echo "========================================="
 ls -lh output/
