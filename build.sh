@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V13 : BakaSU + SUSFS 2.3.0 (cyberc3rd)
+# BRANCHE TEST-SUSFS-CYBERC3RD-V14 : BakaSU + SUSFS 2.3.0 (Patch Direct)
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -44,23 +44,20 @@ for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepo
     find . -name "$pattern" -type f -exec sed -i 's/\$(error/\$(warning/g' {} + 2>/dev/null || true
 done
 
-# ==================== 4. PATCH SUSFS (cyberc3rd 2.3.0) ====================
-echo "=== Patch SUSFS 4.19 (cyberc3rd) ==="
-cd "$GITHUB_WORKSPACE"
-rm -rf /tmp/cyber_repo
-# Clonage du dépôt cyberc3rd plus récent et mieux maintenu pour le Non-GKI
-git clone --depth=1 https://github.com/cyberc3dr/NonGKI_Kernel_Patches.git /tmp/cyber_repo 2>/dev/null || true
-
+# ==================== 4. PATCH SUSFS (cyberc3rd 4.19 - URL DIRECTE) ====================
+echo "=== Patch SUSFS 4.19 (cyberc3rd rebase) ==="
 cd "$GITHUB_WORKSPACE/kernel_sources"
-# Recherche robuste du patch 4.19 dans tout le dépôt
-PATCH_419=$(find /tmp/cyber_repo -type f -name "*4.19*.patch" 2>/dev/null | head -1)
 
-if [ -n "$PATCH_419" ]; then
-    echo "Application du patch : $PATCH_419"
-    patch -p1 < "$PATCH_419" 2>&1 | tail -10 || true
+PATCH_URL="https://raw.githubusercontent.com/cyberc3dr/nGKI_Kernel_Build/rebase/Patches/Patch/susfs_patch_to_4.19.patch"
+echo "Téléchargement du patch depuis : $PATCH_URL"
+
+if curl -sSfL "$PATCH_URL" -o /tmp/susfs_4.19.patch; then
+    echo "Application du patch..."
+    patch -p1 < /tmp/susfs_4.19.patch 2>&1 | tail -15 || true
+    rm -f /tmp/susfs_4.19.patch
 else
-    echo "⚠️ Aucun patch 4.19 trouvé dans le dépôt cyberc3rd. Vérifiez le nom du fichier."
-    find /tmp/cyber_repo -name "*.patch"
+    echo "❌ Échec du téléchargement du patch SUSFS. Vérifiez l'URL."
+    exit 1
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
@@ -227,5 +224,5 @@ cp final_boot.img output/BakaSU-SUSFS-cyberc3rd-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
-echo "=== BUILD TERMINÉ v13 ==="
+echo "=== BUILD TERMINÉ v14 ==="
 ls -lh output/
