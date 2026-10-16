@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V23 : Smart Fix (Détection de code existant)
+# BRANCHE TEST-SUSFS-CYBERC3RD-V24 : Correction robuste __maybe_unused + Smart Fix
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -55,7 +55,6 @@ echo "Téléchargement du patch depuis : $PATCH_URL"
 
 if curl -sSfL "$PATCH_URL" -o /tmp/susfs_4.19.patch; then
     echo "Application du patch..."
-    # On ignore les erreurs de hunk car le noyau LineageOS a déjà des modifications partielles
     patch -p1 < /tmp/susfs_4.19.patch 2>&1 | tail -15 || true
     rm -f /tmp/susfs_4.19.patch
 else
@@ -64,50 +63,57 @@ else
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. SMART FIX : Ajout du header manquant dans fs/super.c ====================
-echo "=== Smart Fix : Vérification des headers SUSFS ==="
+# ==================== 5. CORRECTIONS ROBUSTES (Python) ====================
+echo "=== Corrections post-patch robustes ==="
 
 python3 << 'PYEOF'
 import os
+import re
 
-# Le problème : LineageOS a déjà le code SUSFS dans fs/super.c, mais il manque le header.
-# La solution : Ajouter #include <linux/susfs_def.h> tout en haut si ce n'est pas déjà là.
+# 1. Correction robuste de __maybe_unused pour la variable 'vma'
+files_to_fix = ["fs/proc/task_mmu.c", "fs/namespace.c", "fs/super.c", "fs/stat.c"]
+for filepath in files_to_fix:
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        # Remplace "struct vm_area_struct *vma;" par "struct vm_area_struct *vma __maybe_unused;"
+        # Cette regex gère n'importe quel nombre d'espaces ou de tabulations
+        new_content = re.sub(
+            r'(\bstruct vm_area_struct\s+\*\s*vma\s*;)',
+            r'struct vm_area_struct *vma __maybe_unused;',
+            content
+        )
+        
+        if new_content != content:
+            with open(filepath, 'w') as f:
+                f.write(new_content)
+            print(f"✅ Correction __maybe_unused appliquée à {filepath}")
 
+# 2. Smart Fix : Ajout du header manquant dans fs/super.c si nécessaire
 filepath = "fs/super.c"
 if os.path.exists(filepath):
     with open(filepath, 'r') as f:
         content = f.read()
     
-    # Si le code SUSFS est présent (ex: DEFAULT_KSU_MNT_MINOR_DEV) mais que le header est absent
-    if "DEFAULT_KSU_MNT_MINOR_DEV" in content or "susfs_is_current_ksu_domain" in content:
-        if "#include <linux/susfs_def.h>" not in content:
-            print("⚠️ Code SUSFS détecté dans fs/super.c, mais header manquant. Ajout en cours...")
-            # Trouver le premier #include pour insérer juste après
-            lines = content.split('\n')
-            first_include_idx = -1
-            for i, line in enumerate(lines):
-                if line.strip().startswith('#include'):
-                    first_include_idx = i
-                    break
-            
-            if first_include_idx != -1:
-                # Insérer après le premier include
-                lines.insert(first_include_idx + 1, '#ifdef CONFIG_KSU_SUSFS')
-                lines.insert(first_include_idx + 2, '#include <linux/susfs_def.h>')
-                lines.insert(first_include_idx + 3, '#endif')
-                with open(filepath, 'w') as f:
-                    f.write('\n'.join(lines))
-                print("✅ Header susfs_def.h ajouté avec succès à fs/super.c")
-            else:
-                print("❌ Impossible de trouver un point d'insertion pour le header.")
-        else:
-            print("✅ fs/super.c est déjà correctement configuré avec le header.")
-    else:
-        print("ℹ️ Aucune trace de code SUSFS détectée dans fs/super.c. Le patch s'en chargera.")
-else:
-    print("❌ fs/super.c introuvable.")
+    if ("DEFAULT_KSU_MNT_MINOR_DEV" in content or "susfs_is_current_ksu_domain" in content) and "#include <linux/susfs_def.h>" not in content:
+        print("⚠️ Code SUSFS détecté dans fs/super.c, mais header manquant. Ajout en cours...")
+        lines = content.split('\n')
+        first_include_idx = -1
+        for i, line in enumerate(lines):
+            if line.strip().startswith('#include'):
+                first_include_idx = i
+                break
+        
+        if first_include_idx != -1:
+            lines.insert(first_include_idx + 1, '#ifdef CONFIG_KSU_SUSFS')
+            lines.insert(first_include_idx + 2, '#include <linux/susfs_def.h>')
+            lines.insert(first_include_idx + 3, '#endif')
+            with open(filepath, 'w') as f:
+                f.write('\n'.join(lines))
+            print("✅ Header susfs_def.h ajouté avec succès à fs/super.c")
 
-# Faire de même pour fs/namespace.c et fs/stat.c si nécessaire
+# 3. Faire de même pour fs/namespace.c et fs/stat.c
 for fpath in ["fs/namespace.c", "fs/stat.c"]:
     if os.path.exists(fpath):
         with open(fpath, 'r') as f:
@@ -122,6 +128,8 @@ for fpath in ["fs/namespace.c", "fs/stat.c"]:
                             f.write('\n'.join(lines))
                         print(f"✅ Header ajouté à {fpath}")
                         break
+
+print("✅ Toutes les corrections post-patch ont réussi.")
 PYEOF
 
 # ==================== 6. CONFIGURATION (FORCÉE) ====================
@@ -293,6 +301,6 @@ cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v23 ==="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v24 ==="
 echo "========================================="
 ls -lh output/
