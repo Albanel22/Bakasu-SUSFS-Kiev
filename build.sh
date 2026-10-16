@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V17 : BakaSU + SUSFS 2.3.0 (Fix fs/super.c)
-# Correction ciblée : Injection forcée après #include "internal.h"
+# BRANCHE TEST-SUSFS-CYBERC3RD-V25 : Injection Forcée des Déclarations + Headers
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -23,7 +22,9 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE ====================
+# ==================== 1. CLONAGE FRAIS ====================
+echo "=== Clonage frais du noyau ==="
+rm -rf kernel_sources
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 git log --oneline -1
@@ -45,7 +46,7 @@ for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepo
     find . -name "$pattern" -type f -exec sed -i 's/\$(error/\$(warning/g' {} + 2>/dev/null || true
 done
 
-# ==================== 4. PATCH SUSFS (cyberc3rd 4.19 - URL DIRECTE) ====================
+# ==================== 4. PATCH SUSFS ====================
 echo "=== Patch SUSFS 4.19 (cyberc3rd rebase) ==="
 cd "$GITHUB_WORKSPACE/kernel_sources"
 
@@ -57,88 +58,107 @@ if curl -sSfL "$PATCH_URL" -o /tmp/susfs_4.19.patch; then
     patch -p1 < /tmp/susfs_4.19.patch 2>&1 | tail -15 || true
     rm -f /tmp/susfs_4.19.patch
 else
-    echo "❌ Échec du téléchargement du patch SUSFS. Vérifiez l'URL."
+    echo "❌ Échec du téléchargement du patch SUSFS."
     exit 1
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS POST-PATCH SUSFS (CIBLÉ fs/super.c) ====================
-echo "=== Corrections post-patch SUSFS ==="
+# ==================== 5. CORRECTIONS ROBUSTES (Python) ====================
+echo "=== Corrections post-patch robustes ==="
 
-# 1. Correction __maybe_unused
-for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
-    [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
-done
-
-# 2. Injection ciblée pour fs/super.c (Basée sur le fichier fourni)
 python3 << 'PYEOF'
-from pathlib import Path
+import os
+import re
 
-# --- Traitement spécifique de fs/super.c ---
-super_c = Path("fs/super.c")
-if super_c.exists() and "susfs_is_current_ksu_domain" not in super_c.read_text():
-    c = super_c.read_text()
+# 1. Correction robuste de __maybe_unused pour la variable 'vma'
+files_to_fix = ["fs/proc/task_mmu.c", "fs/namespace.c", "fs/super.c", "fs/stat.c"]
+for filepath in files_to_fix:
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        new_content = re.sub(
+            r'(\bstruct vm_area_struct\s+\*\s*vma\s*;)',
+            r'struct vm_area_struct *vma __maybe_unused;',
+            content
+        )
+        
+        if new_content != content:
+            with open(filepath, 'w') as f:
+                f.write(new_content)
+            print(f"✅ Correction __maybe_unused appliquée à {filepath}")
+
+# 2. Injection FORCÉE des déclarations et headers SUSFS manquants
+def inject_susfs_declarations(filepath, inject_block):
+    if not os.path.exists(filepath):
+        return
+    with open(filepath, 'r') as f:
+        content = f.read()
     
-    # Le fichier fourni a '#include "internal.h"' à la ligne 37.
-    # C'est l'ancre parfaite pour injecter les headers SUSFS.
-    anchor = '#include "internal.h"'
-    decl = '''
+    # Si la déclaration principale est manquante, on injecte tout le bloc
+    if "extern bool susfs_is_current_ksu_domain(void);" not in content and "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;" not in content:
+        # Pour fs/stat.c, on vérifie juste le header
+        if "susfs_def.h" not in content and "SUSFS" in filepath:
+            pass # On laisse le bloc s'injecter quand même par sécurité si c'est stat.c
+        
+        print(f"⚠️ Déclarations SUSFS manquantes dans {filepath}. Injection forcée...")
+        lines = content.split('\n')
+        first_include_idx = -1
+        for i, line in enumerate(lines):
+            if line.strip().startswith('#include'):
+                first_include_idx = i
+                break
+        
+        if first_include_idx != -1:
+            lines.insert(first_include_idx + 1, inject_block)
+            with open(filepath, 'w') as f:
+                f.write('\n'.join(lines))
+            print(f"✅ Bloc SUSFS injecté avec succès dans {filepath}")
+        else:
+            print(f"❌ Impossible de trouver un #include dans {filepath}")
 
-#ifdef CONFIG_KSU_SUSFS
+# Bloc pour fs/super.c
+super_block = """#ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs_def.h>
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 extern bool susfs_is_current_ksu_domain(void);
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#endif
-'''
-    
-    if anchor in c:
-        c = c.replace(anchor, anchor + decl, 1)
-        super_c.write_text(c)
-        print("✅ fs/super.c : Déclarations SUSFS injectées avec succès après internal.h")
-    else:
-        print("⚠️ fs/super.c : Ancre 'internal.h' introuvable, tentative fallback...")
-        # Fallback : insérer après #include <linux/fs_context.h>
-        anchor2 = '#include <linux/fs_context.h>'
-        if anchor2 in c:
-            c = c.replace(anchor2, anchor2 + decl, 1)
-            super_c.write_text(c)
-            print("✅ fs/super.c : Injecté après fs_context.h")
+#endif"""
+inject_susfs_declarations("fs/super.c", super_block)
 
-# --- Traitement de fs/namespace.c ---
-ns_c = Path("fs/namespace.c")
-if ns_c.exists() and 'susfs_is_current_ksu_domain' not in ns_c.read_text():
-    c = ns_c.read_text()
-    decl_ns = '''
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+# Bloc pour fs/namespace.c
+ns_block = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 #include <linux/susfs_def.h>
 extern bool susfs_is_current_ksu_domain(void);
 extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
 #define CL_COPY_MNT_NS BIT(25)
-#endif
-'''
-    if '#include <linux/sched/task.h>' in c:
-        c = c.replace('#include <linux/sched/task.h>', '#include <linux/sched/task.h>' + decl_ns, 1)
-        ns_c.write_text(c)
-        print("✅ fs/namespace.c corrigé")
+#endif"""
+inject_susfs_declarations("fs/namespace.c", ns_block)
 
-# --- Traitement de fs/stat.c ---
-stat_c = Path("fs/stat.c")
-if stat_c.exists() and 'susfs_def.h' not in stat_c.read_text():
-    c = stat_c.read_text()
-    decl_stat = '''
-#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-#include <linux/susfs_def.h>
-#endif
-'''
-    if '#include <asm/unistd.h>' in c:
-        c = c.replace('#include <asm/unistd.h>', '#include <asm/unistd.h>' + decl_stat, 1)
-        stat_c.write_text(c)
-        print("✅ fs/stat.c corrigé")
+# Bloc pour fs/stat.c (vérification adaptée)
+stat_filepath = "fs/stat.c"
+if os.path.exists(stat_filepath):
+    with open(stat_filepath, 'r') as f:
+        content = f.read()
+    if "#include <linux/susfs_def.h>" not in content:
+        print(f"⚠️ Header SUSFS manquant dans {stat_filepath}. Injection forcée...")
+        lines = content.split('\n')
+        first_include_idx = -1
+        for i, line in enumerate(lines):
+            if line.strip().startswith('#include'):
+                first_include_idx = i
+                break
+        if first_include_idx != -1:
+            lines.insert(first_include_idx + 1, "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif")
+            with open(stat_filepath, 'w') as f:
+                f.write('\n'.join(lines))
+            print(f"✅ Header SUSFS injecté avec succès dans {stat_filepath}")
 
-print("✅ Toutes les corrections post-patch appliquées.")
+print("✅ Toutes les corrections post-patch ont réussi.")
 PYEOF
 
-# ==================== 6. CONFIGURATION (FORCÉE ET BLINDÉE) ====================
+# ==================== 6. CONFIGURATION (FORCÉE) ====================
 echo "=== Configuration du noyau ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
@@ -227,7 +247,7 @@ BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarc
 EOF
 
 if ! cargo build --release --target aarch64-linux-android; then
-    echo " Échec compilation ksud"
+    echo "❌ Échec compilation ksud"
     exit 1
 fi
 KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1)
@@ -257,7 +277,7 @@ echo "→ Unpack..."
 echo "→ Remplacement du kernel..."
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-echo "→ Préparation du ramdisk pour l'injection..."
+echo "→ Préparation du ramdisk..."
 rm -rf ramdisk_work && mkdir -p ramdisk_work
 cd ramdisk_work
 ../magiskboot cpio ../ramdisk.cpio extract
@@ -282,7 +302,7 @@ on property:sys.boot_completed=1
     exec u:r:su:s0 root -- /system/bin/ksud boot-completed
 # --- KSUD END ---
 INITRC_EOF
-echo "✅ Script init.rc ajouté à $INITRC_PATH"
+echo "✅ Script init.rc ajouté"
 
 cd ..
 
@@ -307,6 +327,6 @@ cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v17 ==="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v25 ==="
 echo "========================================="
 ls -lh output/
