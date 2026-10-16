@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V17 : BakaSU + SUSFS 2.3.0 (Script Final Validé)
-# Correction : Ancre exacte "#include \"internal.h\"" pour fs/super.c
+# BRANCHE TEST-SUSFS-CYBERC3RD-V18 : BakaSU + SUSFS 2.3.0 (Script "Marteau-Piqueur")
+# Correction : Injection garantie via sed (plus de Python fragile pour super.c)
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -62,96 +62,62 @@ else
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS POST-PATCH SUSFS (ANCRE EXACTE) ====================
-echo "=== Corrections post-patch SUSFS ==="
+# ==================== 5. CORRECTIONS POST-PATCH SUSFS (SED MARTHEAU-PIQUEUR) ====================
+echo "=== Corrections post-patch SUSFS (Injection forcée) ==="
 
 # 1. Correction __maybe_unused
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
 done
 
-# 2. Injection robuste des headers (Script Python avec ancre exacte)
-python3 << 'PYEOF'
-from pathlib import Path
+# 2. Injection GARANTIE dans fs/super.c via sed
+if ! grep -q "susfs_is_current_ksu_domain" fs/super.c; then
+    echo "⚠️ fs/super.c : Déclarations manquantes, injection via sed..."
+    if grep -q '#include "internal.h"' fs/super.c; then
+        sed -i '/#include "internal.h"/a\
+#ifdef CONFIG_KSU_SUSFS\
+#include <linux/susfs_def.h>\
+#endif\
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
+extern bool susfs_is_current_ksu_domain(void);\
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
+#endif' fs/super.c
+    else
+        # Fallback ultime : ligne 26 (juste après les commentaires de licence)
+        sed -i '26a\
+#ifdef CONFIG_KSU_SUSFS\
+#include <linux/susfs_def.h>\
+#endif\
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
+extern bool susfs_is_current_ksu_domain(void);\
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
+#endif' fs/super.c
+    fi
+    echo "✅ fs/super.c corrigé avec succès"
+else
+    echo "✅ fs/super.c : Déclarations déjà présentes"
+fi
 
-decl_super = '''
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs_def.h>
-#endif
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-extern bool susfs_is_current_ksu_domain(void);
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#endif
-'''
+# 3. Injection dans fs/namespace.c
+if ! grep -q "susfs_is_current_ksu_domain" fs/namespace.c; then
+    sed -i '/#include <linux\/sched\/task.h>/a\
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
+#include <linux/susfs_def.h>\
+extern bool susfs_is_current_ksu_domain(void);\
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
+#define CL_COPY_MNT_NS BIT(25)\
+#endif' fs/namespace.c 2>/dev/null || true
+    echo "✅ fs/namespace.c corrigé"
+fi
 
-decl_ns = '''
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-#include <linux/susfs_def.h>
-extern bool susfs_is_current_ksu_domain(void);
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#define CL_COPY_MNT_NS BIT(25)
-#endif
-'''
-
-decl_stat = '''
-#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-#include <linux/susfs_def.h>
-#endif
-'''
-
-def inject_after(content, anchor, declaration):
-    if anchor in content:
-        return content.replace(anchor, anchor + declaration, 1)
-    return None
-
-# --- Traitement de fs/super.c (Ancre exacte trouvée dans votre fichier) ---
-super_c = Path("fs/super.c")
-if super_c.exists() and 'susfs_is_current_ksu_domain' not in super_c.read_text():
-    c = super_c.read_text()
-    # Ancre principale : #include "internal.h" (ligne 26 de votre fichier)
-    injected = inject_after(c, '#include "internal.h"', decl_super)
-    if not injected:
-        # Fallback 1
-        injected = inject_after(c, '#include <linux/mount.h>', decl_super)
-    if not injected:
-        # Fallback ultime : insérer à la ligne 27
-        lines = c.split('\n')
-        lines.insert(27, decl_super)
-        injected = '\n'.join(lines)
-    
-    super_c.write_text(injected)
-    print("✅ fs/super.c : Déclarations SUSFS injectées de force après les includes")
-
-# --- Traitement de fs/namespace.c ---
-ns_c = Path("fs/namespace.c")
-if ns_c.exists() and 'susfs_is_current_ksu_domain' not in ns_c.read_text():
-    c = ns_c.read_text()
-    injected = inject_after(c, '#include <linux/sched/task.h>', decl_ns)
-    if not injected:
-        injected = inject_after(c, '#include <linux/mount.h>', decl_ns)
-    if not injected:
-        lines = c.split('\n')
-        lines.insert(20, decl_ns)
-        injected = '\n'.join(lines)
-    ns_c.write_text(injected)
-    print("✅ fs/namespace.c : Déclarations SUSFS injectées")
-
-# --- Traitement de fs/stat.c ---
-stat_c = Path("fs/stat.c")
-if stat_c.exists() and 'susfs_def.h' not in stat_c.read_text():
-    c = stat_c.read_text()
-    injected = inject_after(c, '#include <asm/unistd.h>', decl_stat)
-    if not injected:
-        injected = inject_after(c, '#include <linux/fs.h>', decl_stat)
-    if not injected:
-        lines = c.split('\n')
-        lines.insert(20, decl_stat)
-        injected = '\n'.join(lines)
-    stat_c.write_text(injected)
-    print("✅ fs/stat.c : Déclarations SUSFS injectées")
-
-print("✅ Toutes les corrections post-patch ont été appliquées avec succès.")
-PYEOF
+# 4. Injection dans fs/stat.c
+if ! grep -q "susfs_def.h" fs/stat.c; then
+    sed -i '/#include <asm\/unistd.h>/a\
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\
+#include <linux/susfs_def.h>\
+#endif' fs/stat.c 2>/dev/null || true
+    echo "✅ fs/stat.c corrigé"
+fi
 
 # ==================== 6. CONFIGURATION (FORCÉE ET BLINDÉE) ====================
 echo "=== Configuration du noyau ==="
@@ -160,10 +126,8 @@ export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 mkdir -p out
 
-# 1. Génération de la config de base
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
-# 2. Ajout des options souhaitées
 cat << 'EOF' >> out/.config
 CONFIG_KSU=y
 CONFIG_KSU_SUSFS=y
@@ -181,18 +145,15 @@ CONFIG_COMPAT=y
 CONFIG_COMPAT_32BIT_TIME=y
 EOF
 
-# 3. Résolution des dépendances
 echo "→ Résolution des dépendances (olddefconfig)..."
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
 
-# 4. OPTION NUCLÉAIRE : Forcer les valeurs APRÈS olddefconfig
 echo "→ Forçage des options KSU (Option Nucléaire)..."
 sed -i 's/^# CONFIG_KSU is not set$/CONFIG_KSU=y/' out/.config
 sed -i 's/^# CONFIG_KSU_SUSFS is not set$/CONFIG_KSU_SUSFS=y/' out/.config
 sed -i 's/^CONFIG_KSU_MANUAL_HOOK=y$/# CONFIG_KSU_MANUAL_HOOK is not set/' out/.config
 sed -i 's/^CONFIG_KSU_TRACEPOINT_HOOK=y$/# CONFIG_KSU_TRACEPOINT_HOOK is not set/' out/.config
 
-# 5. VÉRIFICATION OBLIGATOIRE
 echo "=== VÉRIFICATION FINALE DU .CONFIG ==="
 grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_KSU_MANUAL_HOOK=" out/.config || echo "❌ ERREUR CRITIQUE : KSU n'est pas activé !"
 
@@ -256,7 +217,7 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
 chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé"
 
-# ==================== 10. REPACK AVEC INJECTION KSUD (Méthode Non-GKI Officielle) ====================
+# ==================== 10. REPACK AVEC INJECTION KSUD ====================
 echo "=== Repack avec injection ksud (Obligatoire pour Non-GKI) ==="
 cd "$GITHUB_WORKSPACE"
 rm -f boot-stock.img dtbo-stock.img
@@ -282,13 +243,11 @@ rm -rf ramdisk_work && mkdir -p ramdisk_work
 cd ramdisk_work
 ../magiskboot cpio ../ramdisk.cpio extract
 
-# 1. Injecter ksud dans le ramdisk
 mkdir -p system/bin
 cp "$GITHUB_WORKSPACE/ksud" system/bin/ksud
 chmod 755 system/bin/ksud
 echo "✅ ksud ajouté au ramdisk (system/bin/)"
 
-# 2. Injecter le script init.rc pour déclencher ksud au boot
 INITRC_PATH="init.rc"
 [ -f "system/etc/init/hw/init.rc" ] && INITRC_PATH="system/etc/init/hw/init.rc"
 
@@ -331,6 +290,6 @@ cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v17 ==="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v18 ==="
 echo "========================================="
 ls -lh output/
