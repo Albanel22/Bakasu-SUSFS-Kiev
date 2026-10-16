@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V24 : Correction robuste __maybe_unused + Smart Fix
+# BRANCHE TEST-SUSFS-CYBERC3RD-V25 : Ajout des déclarations extern manquantes
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -63,8 +63,8 @@ else
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS ROBUSTES (Python) ====================
-echo "=== Corrections post-patch robustes ==="
+# ==================== 5. CORRECTIONS COMPLÈTES (Headers + Extern) ====================
+echo "=== Corrections post-patch complètes ==="
 
 python3 << 'PYEOF'
 import os
@@ -77,8 +77,6 @@ for filepath in files_to_fix:
         with open(filepath, 'r') as f:
             content = f.read()
         
-        # Remplace "struct vm_area_struct *vma;" par "struct vm_area_struct *vma __maybe_unused;"
-        # Cette regex gère n'importe quel nombre d'espaces ou de tabulations
         new_content = re.sub(
             r'(\bstruct vm_area_struct\s+\*\s*vma\s*;)',
             r'struct vm_area_struct *vma __maybe_unused;',
@@ -90,44 +88,106 @@ for filepath in files_to_fix:
                 f.write(new_content)
             print(f"✅ Correction __maybe_unused appliquée à {filepath}")
 
-# 2. Smart Fix : Ajout du header manquant dans fs/super.c si nécessaire
+# 2. Ajout du header ET des déclarations extern dans fs/super.c
 filepath = "fs/super.c"
 if os.path.exists(filepath):
     with open(filepath, 'r') as f:
         content = f.read()
     
-    if ("DEFAULT_KSU_MNT_MINOR_DEV" in content or "susfs_is_current_ksu_domain" in content) and "#include <linux/susfs_def.h>" not in content:
-        print("⚠️ Code SUSFS détecté dans fs/super.c, mais header manquant. Ajout en cours...")
-        lines = content.split('\n')
-        first_include_idx = -1
-        for i, line in enumerate(lines):
-            if line.strip().startswith('#include'):
-                first_include_idx = i
-                break
+    # Si le code SUSFS est utilisé mais que les déclarations extern sont manquantes
+    if ("DEFAULT_KSU_MNT_MINOR_DEV" in content or "susfs_is_current_ksu_domain" in content):
+        needs_fix = False
+        if "#include <linux/susfs_def.h>" not in content:
+            needs_fix = True
+        if "extern bool susfs_is_current_ksu_domain" not in content:
+            needs_fix = True
+        if "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted" not in content:
+            needs_fix = True
         
-        if first_include_idx != -1:
-            lines.insert(first_include_idx + 1, '#ifdef CONFIG_KSU_SUSFS')
-            lines.insert(first_include_idx + 2, '#include <linux/susfs_def.h>')
-            lines.insert(first_include_idx + 3, '#endif')
-            with open(filepath, 'w') as f:
-                f.write('\n'.join(lines))
-            print("✅ Header susfs_def.h ajouté avec succès à fs/super.c")
+        if needs_fix:
+            print("⚠️ Code SUSFS détecté dans fs/super.c, mais déclarations manquantes. Ajout en cours...")
+            lines = content.split('\n')
+            first_include_idx = -1
+            for i, line in enumerate(lines):
+                if line.strip().startswith('#include'):
+                    first_include_idx = i
+                    break
+            
+            if first_include_idx != -1:
+                # Insérer le header et les déclarations extern
+                insert_lines = [
+                    '#ifdef CONFIG_KSU_SUSFS',
+                    '#include <linux/susfs_def.h>',
+                    '#endif',
+                    '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+                    'extern bool susfs_is_current_ksu_domain(void);',
+                    'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;',
+                    '#endif'
+                ]
+                
+                # Vérifier si déjà présent pour éviter les doublons
+                if '#include <linux/susfs_def.h>' not in content:
+                    for j, insert_line in enumerate(insert_lines):
+                        lines.insert(first_include_idx + 1 + j, insert_line)
+                
+                with open(filepath, 'w') as f:
+                    f.write('\n'.join(lines))
+                print("✅ Header et déclarations extern ajoutés avec succès à fs/super.c")
+            else:
+                print("❌ Impossible de trouver un point d'insertion pour les déclarations.")
+        else:
+            print("✅ fs/super.c est déjà correctement configuré.")
 
-# 3. Faire de même pour fs/namespace.c et fs/stat.c
-for fpath in ["fs/namespace.c", "fs/stat.c"]:
-    if os.path.exists(fpath):
-        with open(fpath, 'r') as f:
-            content = f.read()
-        if "susfs_is_current_ksu_domain" in content or "SUSFS" in content:
-            if "#include <linux/susfs_def.h>" not in content:
-                lines = content.split('\n')
-                for i, line in enumerate(lines):
-                    if line.strip().startswith('#include'):
-                        lines.insert(i + 1, '#include <linux/susfs_def.h>')
-                        with open(fpath, 'w') as f:
-                            f.write('\n'.join(lines))
-                        print(f"✅ Header ajouté à {fpath}")
-                        break
+# 3. Faire de même pour fs/namespace.c
+fpath = "fs/namespace.c"
+if os.path.exists(fpath):
+    with open(fpath, 'r') as f:
+        content = f.read()
+    if "susfs_is_current_ksu_domain" in content:
+        needs_fix = False
+        if "#include <linux/susfs_def.h>" not in content:
+            needs_fix = True
+        if "extern bool susfs_is_current_ksu_domain" not in content:
+            needs_fix = True
+        
+        if needs_fix:
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                if line.strip().startswith('#include'):
+                    insert_lines = [
+                        '#ifdef CONFIG_KSU_SUSFS',
+                        '#include <linux/susfs_def.h>',
+                        '#endif',
+                        '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+                        'extern bool susfs_is_current_ksu_domain(void);',
+                        'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;',
+                        '#define CL_COPY_MNT_NS BIT(25)',
+                        '#endif'
+                    ]
+                    for j, insert_line in enumerate(insert_lines):
+                        lines.insert(i + 1 + j, insert_line)
+                    with open(fpath, 'w') as f:
+                        f.write('\n'.join(lines))
+                    print(f"✅ Header et déclarations extern ajoutés à {fpath}")
+                    break
+
+# 4. Faire de même pour fs/stat.c
+fpath = "fs/stat.c"
+if os.path.exists(fpath):
+    with open(fpath, 'r') as f:
+        content = f.read()
+    if "SUSFS" in content or "susfs" in content:
+        if "#include <linux/susfs_def.h>" not in content:
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                if line.strip().startswith('#include'):
+                    lines.insert(i + 1, '#ifdef CONFIG_KSU_SUSFS')
+                    lines.insert(i + 2, '#include <linux/susfs_def.h>')
+                    lines.insert(i + 3, '#endif')
+                    with open(fpath, 'w') as f:
+                        f.write('\n'.join(lines))
+                    print(f"✅ Header ajouté à {fpath}")
+                    break
 
 print("✅ Toutes les corrections post-patch ont réussi.")
 PYEOF
@@ -301,6 +361,6 @@ cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v24 ==="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v25 ==="
 echo "========================================="
 ls -lh output/
