@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V14 : BakaSU + SUSFS 2.3.0 (Patch Direct)
+# BRANCHE TEST-SUSFS-CYBERC3RD-V15 : BakaSU + SUSFS 2.3.0 (Script Final Corrigé)
+# Corrections : Configuration forcée + Injection ksud dans le ramdisk
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -61,13 +62,13 @@ else
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS POST-PATCH SUSFS ====================
+# ==================== 5. CORRECTIONS POST-PATCH SUSFS (ROBUSTE) ====================
 echo "=== Corrections post-patch SUSFS ==="
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
 done
 
-# Injection des headers susfs_def.h si manquants (sécurité)
+# Injection des headers susfs_def.h avec fallback ultime si l'ancre est manquante
 python3 << 'PYEOF'
 from pathlib import Path
 files = {
@@ -93,43 +94,72 @@ extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
 }
 for fp, (anchor, decl) in files.items():
     p = Path(fp)
-    if p.exists() and 'susfs_def.h' not in p.read_text():
-        c = p.read_text()
-        if anchor in c:
-            p.write_text(c.replace(anchor, anchor + '\n' + decl, 1))
+    if not p.exists():
+        continue
+    c = p.read_text()
+    if 'susfs_is_current_ksu_domain' in c or 'susfs_def.h' in c:
+        print(f"✅ {fp} déjà patché")
+        continue
+    
+    print(f"⚠️ {fp} : Patch manquant, correction manuelle...")
+    if anchor in c:
+        c = c.replace(anchor, anchor + '\n' + decl, 1)
+    else:
+        # Fallback ultime : insérer après le dernier #include
+        lines = c.split('\n')
+        last_inc = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('#include'):
+                last_inc = i
+        lines.insert(last_inc + 1, decl)
+        c = '\n'.join(lines)
+        print(f"   -> Injecté après le dernier #include")
+    p.write_text(c)
+    print(f"✅ {fp} corrigé")
 PYEOF
 
-# ==================== 6. CONFIGURATION (SUSFS UNIQUEMENT) ====================
-echo "=== Configuration (SUSFS Pure) ==="
+# ==================== 6. CONFIGURATION (FORCÉE ET BLINDÉE) ====================
+echo "=== Configuration du noyau ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 mkdir -p out
+
+# 1. Génération de la config de base
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
-{
-  echo "CONFIG_KSU=y"
-  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
-  echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
-  echo "CONFIG_KSU_SUSFS=y"
-  echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-  echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-  echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-  echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-  echo "CONFIG_KALLSYMS_ALL=y"
-  echo "CONFIG_COMPAT=y"
-  echo "CONFIG_COMPAT_32BIT_TIME=y"
-} >> out/.config
+# 2. Ajout des options souhaitées
+cat << 'EOF' >> out/.config
+CONFIG_KSU=y
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_SUS_MAP=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_COMPAT=y
+CONFIG_COMPAT_32BIT_TIME=y
+EOF
 
-echo "=== Vérification .config ==="
-make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
-echo "--- Configuration KSU finale ---"
-grep -E "CONFIG_KSU|CONFIG_KALLSYMS" out/.config | grep -v "^#"
+# 3. Résolution des dépendances
+echo "→ Résolution des dépendances (olddefconfig)..."
+make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
+
+# 4. OPTION NUCLÉAIRE : Forcer les valeurs APRÈS olddefconfig
+echo "→ Forçage des options KSU (Option Nucléaire)..."
+sed -i 's/^# CONFIG_KSU is not set$/CONFIG_KSU=y/' out/.config
+sed -i 's/^# CONFIG_KSU_SUSFS is not set$/CONFIG_KSU_SUSFS=y/' out/.config
+sed -i 's/^CONFIG_KSU_MANUAL_HOOK=y$/# CONFIG_KSU_MANUAL_HOOK is not set/' out/.config
+sed -i 's/^CONFIG_KSU_TRACEPOINT_HOOK=y$/# CONFIG_KSU_TRACEPOINT_HOOK is not set/' out/.config
+
+# 5. VÉRIFICATION OBLIGATOIRE
+echo "=== VÉRIFICATION FINALE DU .CONFIG ==="
+grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_KSU_MANUAL_HOOK=" out/.config || echo "❌ ERREUR CRITIQUE : KSU n'est pas activé !"
 
 # ==================== 7. PATCHS MOTOROLA ====================
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
@@ -191,8 +221,8 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
 chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé"
 
-# ==================== 10. REPACK SIMPLE ====================
-echo "=== Repack ==="
+# ==================== 10. REPACK AVEC INJECTION KSUD (Méthode Non-GKI Officielle) ====================
+echo "=== Repack avec injection ksud (Obligatoire pour Non-GKI) ==="
 cd "$GITHUB_WORKSPACE"
 rm -f boot-stock.img dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1
@@ -212,11 +242,51 @@ echo "→ Unpack..."
 echo "→ Remplacement du kernel..."
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
+echo "→ Préparation du ramdisk pour l'injection..."
+rm -rf ramdisk_work && mkdir -p ramdisk_work
+cd ramdisk_work
+../magiskboot cpio ../ramdisk.cpio extract
+
+# 1. Injecter ksud dans le ramdisk
+mkdir -p system/bin
+cp "$GITHUB_WORKSPACE/ksud" system/bin/ksud
+chmod 755 system/bin/ksud
+echo "✅ ksud ajouté au ramdisk (system/bin/)"
+
+# 2. Injecter le script init.rc pour déclencher ksud au boot
+INITRC_PATH="init.rc"
+[ -f "system/etc/init/hw/init.rc" ] && INITRC_PATH="system/etc/init/hw/init.rc"
+
+mkdir -p "$(dirname "$INITRC_PATH")"
+cat >> "$INITRC_PATH" << 'INITRC_EOF'
+
+# --- KSUD START ---
+on post-fs-data
+    exec u:r:su:s0 root -- /system/bin/ksud post-fs-data
+
+on nonencrypted
+    exec u:r:su:s0 root -- /system/bin/ksud services
+
+on property:sys.boot_completed=1
+    exec u:r:su:s0 root -- /system/bin/ksud boot-completed
+# --- KSUD END ---
+INITRC_EOF
+echo "✅ Script init.rc ajouté à $INITRC_PATH"
+
+cd ..
+
+echo "→ Reconstruction du ramdisk avec les ajouts..."
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 system" \
+    "mkdir 0755 system/bin" \
+    "add 0755 system/bin/ksud ramdisk_work/system/bin/ksud" \
+    "add 0750 $INITRC_PATH ramdisk_work/$INITRC_PATH"
+
 echo "→ Repack..."
 ./magiskboot repack boot.img new-boot.img
 [ ! -f "new-boot.img" ] && { echo "❌ Échec repack"; exit 1; }
 mv new-boot.img ../final_boot.img && cd ..
-echo "✅ Repack terminé"
+echo "✅ Repack terminé avec injection ksud"
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
@@ -224,5 +294,8 @@ cp final_boot.img output/BakaSU-SUSFS-cyberc3rd-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
-echo "=== BUILD TERMINÉ v14 ==="
+echo ""
+echo "========================================="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v15 ==="
+echo "========================================="
 ls -lh output/
