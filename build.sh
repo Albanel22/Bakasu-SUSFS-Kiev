@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V22 : Approche "Additive Pure" (Sans nettoyage destructeur)
+# BRANCHE TEST-SUSFS-CYBERC3RD-V23 : Smart Fix (Détection de code existant)
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -22,7 +22,7 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE FRAIS (Garanti sans débris) ====================
+# ==================== 1. CLONAGE FRAIS ====================
 echo "=== Clonage frais du noyau ==="
 rm -rf kernel_sources
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
@@ -46,7 +46,7 @@ for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepo
     find . -name "$pattern" -type f -exec sed -i 's/\$(error/\$(warning/g' {} + 2>/dev/null || true
 done
 
-# ==================== 4. PATCH SUSFS (cyberc3rd 4.19) ====================
+# ==================== 4. PATCH SUSFS ====================
 echo "=== Patch SUSFS 4.19 (cyberc3rd rebase) ==="
 cd "$GITHUB_WORKSPACE/kernel_sources"
 
@@ -55,6 +55,7 @@ echo "Téléchargement du patch depuis : $PATCH_URL"
 
 if curl -sSfL "$PATCH_URL" -o /tmp/susfs_4.19.patch; then
     echo "Application du patch..."
+    # On ignore les erreurs de hunk car le noyau LineageOS a déjà des modifications partielles
     patch -p1 < /tmp/susfs_4.19.patch 2>&1 | tail -15 || true
     rm -f /tmp/susfs_4.19.patch
 else
@@ -63,72 +64,64 @@ else
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS POST-PATCH (ADDITIVES PURES) ====================
-echo "=== Corrections post-patch SUSFS (Injection additive) ==="
+# ==================== 5. SMART FIX : Ajout du header manquant dans fs/super.c ====================
+echo "=== Smart Fix : Vérification des headers SUSFS ==="
 
-# 1. Correction __maybe_unused
-for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
-    [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
-done
-
-# 2. Injection Python SÉCURISÉE (Aucune suppression, uniquement ajout)
 python3 << 'PYEOF'
 import os
 
-def inject_headers(filepath, headers):
-    if not os.path.exists(filepath):
-        return
+# Le problème : LineageOS a déjà le code SUSFS dans fs/super.c, mais il manque le header.
+# La solution : Ajouter #include <linux/susfs_def.h> tout en haut si ce n'est pas déjà là.
+
+filepath = "fs/super.c"
+if os.path.exists(filepath):
     with open(filepath, 'r') as f:
-        lines = f.readlines()
+        content = f.read()
     
-    content = "".join(lines)
-    # Si déjà présent, on ne touche à rien (sécurité)
-    if 'susfs_is_current_ksu_domain' in content or 'susfs_def.h' in content:
-        print(f"✅ {filepath}: Headers déjà présents.")
-        return
-
-    # Trouver le dernier #include dans les 60 premières lignes
-    last_include = -1
-    for i in range(min(60, len(lines))):
-        if lines[i].strip().startswith('#include'):
-            last_include = i
-    
-    if last_include != -1:
-        # Insérer juste après le dernier #include
-        lines.insert(last_include + 1, headers + '\n')
-        with open(filepath, 'w') as f:
-            f.writelines(lines)
-        print(f"✅ {filepath}: Headers injectés après la ligne {last_include + 1}")
+    # Si le code SUSFS est présent (ex: DEFAULT_KSU_MNT_MINOR_DEV) mais que le header est absent
+    if "DEFAULT_KSU_MNT_MINOR_DEV" in content or "susfs_is_current_ksu_domain" in content:
+        if "#include <linux/susfs_def.h>" not in content:
+            print("⚠️ Code SUSFS détecté dans fs/super.c, mais header manquant. Ajout en cours...")
+            # Trouver le premier #include pour insérer juste après
+            lines = content.split('\n')
+            first_include_idx = -1
+            for i, line in enumerate(lines):
+                if line.strip().startswith('#include'):
+                    first_include_idx = i
+                    break
+            
+            if first_include_idx != -1:
+                # Insérer après le premier include
+                lines.insert(first_include_idx + 1, '#ifdef CONFIG_KSU_SUSFS')
+                lines.insert(first_include_idx + 2, '#include <linux/susfs_def.h>')
+                lines.insert(first_include_idx + 3, '#endif')
+                with open(filepath, 'w') as f:
+                    f.write('\n'.join(lines))
+                print("✅ Header susfs_def.h ajouté avec succès à fs/super.c")
+            else:
+                print("❌ Impossible de trouver un point d'insertion pour le header.")
+        else:
+            print("✅ fs/super.c est déjà correctement configuré avec le header.")
     else:
-        # Fallback ultime
-        lines.insert(40, headers + '\n')
-        with open(filepath, 'w') as f:
-            f.writelines(lines)
-        print(f"⚠️ {filepath}: Headers injectés à la ligne 40 (fallback)")
+        print("ℹ️ Aucune trace de code SUSFS détectée dans fs/super.c. Le patch s'en chargera.")
+else:
+    print("❌ fs/super.c introuvable.")
 
-super_headers = """#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs_def.h>
-#endif
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-extern bool susfs_is_current_ksu_domain(void);
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#endif"""
-inject_headers('fs/super.c', super_headers)
-
-ns_headers = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-#include <linux/susfs_def.h>
-extern bool susfs_is_current_ksu_domain(void);
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#define CL_COPY_MNT_NS BIT(25)
-#endif"""
-inject_headers('fs/namespace.c', ns_headers)
-
-stat_headers = """#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-#include <linux/susfs_def.h>
-#endif"""
-inject_headers('fs/stat.c', stat_headers)
-
-print("✅ Toutes les injections additives ont réussi.")
+# Faire de même pour fs/namespace.c et fs/stat.c si nécessaire
+for fpath in ["fs/namespace.c", "fs/stat.c"]:
+    if os.path.exists(fpath):
+        with open(fpath, 'r') as f:
+            content = f.read()
+        if "susfs_is_current_ksu_domain" in content or "SUSFS" in content:
+            if "#include <linux/susfs_def.h>" not in content:
+                lines = content.split('\n')
+                for i, line in enumerate(lines):
+                    if line.strip().startswith('#include'):
+                        lines.insert(i + 1, '#include <linux/susfs_def.h>')
+                        with open(fpath, 'w') as f:
+                            f.write('\n'.join(lines))
+                        print(f"✅ Header ajouté à {fpath}")
+                        break
 PYEOF
 
 # ==================== 6. CONFIGURATION (FORCÉE) ====================
@@ -300,6 +293,6 @@ cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v22 ==="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v23 ==="
 echo "========================================="
 ls -lh output/
