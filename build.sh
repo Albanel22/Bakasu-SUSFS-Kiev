@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V21 : Injection Chirurgicale (Ligne 41)
-# Basé sur l'information précise : includes de la ligne 24 à 40, ligne 41 vide.
+# BRANCHE TEST-SUSFS-CYBERC3RD-V22 : Approche "Additive Pure" (Sans nettoyage destructeur)
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -23,8 +22,8 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE (NETTOYAGE FORCÉ) ====================
-echo "=== Nettoyage et clonage ==="
+# ==================== 1. CLONAGE FRAIS (Garanti sans débris) ====================
+echo "=== Clonage frais du noyau ==="
 rm -rf kernel_sources
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
@@ -47,7 +46,7 @@ for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepo
     find . -name "$pattern" -type f -exec sed -i 's/\$(error/\$(warning/g' {} + 2>/dev/null || true
 done
 
-# ==================== 4. PATCH SUSFS (cyberc3rd 4.19 - URL DIRECTE) ====================
+# ==================== 4. PATCH SUSFS (cyberc3rd 4.19) ====================
 echo "=== Patch SUSFS 4.19 (cyberc3rd rebase) ==="
 cd "$GITHUB_WORKSPACE/kernel_sources"
 
@@ -59,58 +58,80 @@ if curl -sSfL "$PATCH_URL" -o /tmp/susfs_4.19.patch; then
     patch -p1 < /tmp/susfs_4.19.patch 2>&1 | tail -15 || true
     rm -f /tmp/susfs_4.19.patch
 else
-    echo "❌ Échec du téléchargement du patch SUSFS. Vérifiez l'URL."
+    echo "❌ Échec du téléchargement du patch SUSFS."
     exit 1
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS POST-PATCH (INJECTION CHIRURGICALE) ====================
-echo "=== Corrections post-patch SUSFS ==="
+# ==================== 5. CORRECTIONS POST-PATCH (ADDITIVES PURES) ====================
+echo "=== Corrections post-patch SUSFS (Injection additive) ==="
 
 # 1. Correction __maybe_unused
 for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
     [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
 done
 
-# 2. NETTOYAGE RADICAL de fs/super.c (On efface TOUTE trace de SUSFS pour repartir à zéro)
-echo "→ Nettoyage radical de fs/super.c..."
-sed -i '/susfs_is_current_ksu_domain/d' fs/super.c
-sed -i '/susfs_is_sdcard_android_data_not_decrypted/d' fs/super.c
-sed -i '/#include <linux\/susfs_def.h>/d' fs/super.c
-sed -i '/^#ifdef CONFIG_KSU_SUSFS$/d' fs/super.c
-sed -i '/^#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT$/d' fs/super.c
-sed -i '/^#endif.*CONFIG_KSU_SUSFS/d' fs/super.c
+# 2. Injection Python SÉCURISÉE (Aucune suppression, uniquement ajout)
+python3 << 'PYEOF'
+import os
 
-# 3. INJECTION CHIRURGICALE à la ligne 41 (juste après le dernier #include)
-echo "→ Injection des déclarations SUSFS à la ligne 41 de fs/super.c..."
-sed -i '40a\
-#ifdef CONFIG_KSU_SUSFS\
-#include <linux/susfs_def.h>\
-#endif\
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
-extern bool susfs_is_current_ksu_domain(void);\
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
-#endif' fs/super.c
-echo "✅ fs/super.c : Déclarations injectées avec succès après la ligne 40"
+def inject_headers(filepath, headers):
+    if not os.path.exists(filepath):
+        return
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+    
+    content = "".join(lines)
+    # Si déjà présent, on ne touche à rien (sécurité)
+    if 'susfs_is_current_ksu_domain' in content or 'susfs_def.h' in content:
+        print(f"✅ {filepath}: Headers déjà présents.")
+        return
 
-# 4. Injection dans fs/namespace.c
-sed -i '/#include <linux\/sched\/task.h>/a\
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
-#include <linux/susfs_def.h>\
-extern bool susfs_is_current_ksu_domain(void);\
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\
-#define CL_COPY_MNT_NS BIT(25)\
-#endif' fs/namespace.c 2>/dev/null || true
-echo "✅ fs/namespace.c corrigé"
+    # Trouver le dernier #include dans les 60 premières lignes
+    last_include = -1
+    for i in range(min(60, len(lines))):
+        if lines[i].strip().startswith('#include'):
+            last_include = i
+    
+    if last_include != -1:
+        # Insérer juste après le dernier #include
+        lines.insert(last_include + 1, headers + '\n')
+        with open(filepath, 'w') as f:
+            f.writelines(lines)
+        print(f"✅ {filepath}: Headers injectés après la ligne {last_include + 1}")
+    else:
+        # Fallback ultime
+        lines.insert(40, headers + '\n')
+        with open(filepath, 'w') as f:
+            f.writelines(lines)
+        print(f"⚠️ {filepath}: Headers injectés à la ligne 40 (fallback)")
 
-# 5. Injection dans fs/stat.c
-sed -i '/#include <asm\/unistd.h>/a\
-#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\
-#include <linux/susfs_def.h>\
-#endif' fs/stat.c 2>/dev/null || true
-echo "✅ fs/stat.c corrigé"
+super_headers = """#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+#endif"""
+inject_headers('fs/super.c', super_headers)
 
-# ==================== 6. CONFIGURATION (FORCÉE ET BLINDÉE) ====================
+ns_headers = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#include <linux/susfs_def.h>
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+#define CL_COPY_MNT_NS BIT(25)
+#endif"""
+inject_headers('fs/namespace.c', ns_headers)
+
+stat_headers = """#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+#include <linux/susfs_def.h>
+#endif"""
+inject_headers('fs/stat.c', stat_headers)
+
+print("✅ Toutes les injections additives ont réussi.")
+PYEOF
+
+# ==================== 6. CONFIGURATION (FORCÉE) ====================
 echo "=== Configuration du noyau ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
@@ -139,7 +160,7 @@ EOF
 echo "→ Résolution des dépendances (olddefconfig)..."
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
 
-echo "→ Forçage des options KSU (Option Nucléaire)..."
+echo "→ Forçage des options KSU..."
 sed -i 's/^# CONFIG_KSU is not set$/CONFIG_KSU=y/' out/.config
 sed -i 's/^# CONFIG_KSU_SUSFS is not set$/CONFIG_KSU_SUSFS=y/' out/.config
 sed -i 's/^CONFIG_KSU_MANUAL_HOOK=y$/# CONFIG_KSU_MANUAL_HOOK is not set/' out/.config
@@ -209,7 +230,7 @@ chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé"
 
 # ==================== 10. REPACK AVEC INJECTION KSUD ====================
-echo "=== Repack avec injection ksud (Obligatoire pour Non-GKI) ==="
+echo "=== Repack avec injection ksud ==="
 cd "$GITHUB_WORKSPACE"
 rm -f boot-stock.img dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1
@@ -229,7 +250,7 @@ echo "→ Unpack..."
 echo "→ Remplacement du kernel..."
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-echo "→ Préparation du ramdisk pour l'injection..."
+echo "→ Préparation du ramdisk..."
 rm -rf ramdisk_work && mkdir -p ramdisk_work
 cd ramdisk_work
 ../magiskboot cpio ../ramdisk.cpio extract
@@ -237,7 +258,7 @@ cd ramdisk_work
 mkdir -p system/bin
 cp "$GITHUB_WORKSPACE/ksud" system/bin/ksud
 chmod 755 system/bin/ksud
-echo "✅ ksud ajouté au ramdisk (system/bin/)"
+echo "✅ ksud ajouté au ramdisk"
 
 INITRC_PATH="init.rc"
 [ -f "system/etc/init/hw/init.rc" ] && INITRC_PATH="system/etc/init/hw/init.rc"
@@ -248,19 +269,17 @@ cat >> "$INITRC_PATH" << 'INITRC_EOF'
 # --- KSUD START ---
 on post-fs-data
     exec u:r:su:s0 root -- /system/bin/ksud post-fs-data
-
 on nonencrypted
     exec u:r:su:s0 root -- /system/bin/ksud services
-
 on property:sys.boot_completed=1
     exec u:r:su:s0 root -- /system/bin/ksud boot-completed
 # --- KSUD END ---
 INITRC_EOF
-echo "✅ Script init.rc ajouté à $INITRC_PATH"
+echo "✅ Script init.rc ajouté"
 
 cd ..
 
-echo "→ Reconstruction du ramdisk avec les ajouts..."
+echo "→ Reconstruction du ramdisk..."
 ./magiskboot cpio ramdisk.cpio \
     "mkdir 0755 system" \
     "mkdir 0755 system/bin" \
@@ -271,7 +290,7 @@ echo "→ Repack..."
 ./magiskboot repack boot.img new-boot.img
 [ ! -f "new-boot.img" ] && { echo "❌ Échec repack"; exit 1; }
 mv new-boot.img ../final_boot.img && cd ..
-echo "✅ Repack terminé avec injection ksud"
+echo "✅ Repack terminé"
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
@@ -281,6 +300,6 @@ cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v21 ==="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v22 ==="
 echo "========================================="
 ls -lh output/
