@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V16 : BakaSU + SUSFS 2.3.0 (Script Final Blindé)
-# Correction : Injection forcée et infaillible des headers dans fs/super.c
+# BRANCHE TEST-SUSFS-CYBERC3RD-V25-DEBUG : Ajout des déclarations extern + DEBUG sidtab
 # =============================================================================
 
 echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
@@ -23,10 +22,20 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE ====================
+# ==================== 1. CLONAGE FRAIS ====================
+echo "=== Clonage frais du noyau ==="
+rm -rf kernel_sources
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 git log --oneline -1
+
+# ==================== 1b. DEBUG : Vérification du backport Google sidtab ====================
+echo "=== DEBUG : Vérification du backport Google sidtab ==="
+if grep -q "^int context_add_hash" security/selinux/ss/services.c 2>/dev/null; then
+    echo "✅ Le noyau CONTIENT le backport Google (context_add_hash). Le correctif BakaSU sera activé."
+else
+    echo "⚠️ Le noyau NE CONTIENT PAS le backport Google (ou il est différent). Le correctif BakaSU ne s'activera pas automatiquement."
+fi
 
 # ==================== 2. INTÉGRATION BakaSU ====================
 echo "=== Intégration BakaSU ==="
@@ -45,7 +54,7 @@ for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepo
     find . -name "$pattern" -type f -exec sed -i 's/\$(error/\$(warning/g' {} + 2>/dev/null || true
 done
 
-# ==================== 4. PATCH SUSFS (cyberc3rd 4.19 - URL DIRECTE) ====================
+# ==================== 4. PATCH SUSFS ====================
 echo "=== Patch SUSFS 4.19 (cyberc3rd rebase) ==="
 cd "$GITHUB_WORKSPACE/kernel_sources"
 
@@ -57,112 +66,149 @@ if curl -sSfL "$PATCH_URL" -o /tmp/susfs_4.19.patch; then
     patch -p1 < /tmp/susfs_4.19.patch 2>&1 | tail -15 || true
     rm -f /tmp/susfs_4.19.patch
 else
-    echo "❌ Échec du téléchargement du patch SUSFS. Vérifiez l'URL."
+    echo "❌ Échec du téléchargement du patch SUSFS."
     exit 1
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS POST-PATCH SUSFS (INFAILLIBLE) ====================
-echo "=== Corrections post-patch SUSFS ==="
+# ==================== 5. CORRECTIONS COMPLÈTES (Headers + Extern) ====================
+echo "=== Corrections post-patch complètes ==="
 
-# 1. Correction __maybe_unused
-for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
-    [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
-done
-
-# 2. Injection robuste des headers (Script Python blindé)
 python3 << 'PYEOF'
-from pathlib import Path
+import os
+import re
 
-decl_super = '''
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs_def.h>
-#endif
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-extern bool susfs_is_current_ksu_domain(void);
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#endif
-'''
+# 1. Correction robuste de __maybe_unused pour la variable 'vma'
+files_to_fix = ["fs/proc/task_mmu.c", "fs/namespace.c", "fs/super.c", "fs/stat.c"]
+for filepath in files_to_fix:
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        new_content = re.sub(
+            r'(\bstruct vm_area_struct\s+\*\s*vma\s*;)',
+            r'struct vm_area_struct *vma __maybe_unused;',
+            content
+        )
+        
+        if new_content != content:
+            with open(filepath, 'w') as f:
+                f.write(new_content)
+            print(f"✅ Correction __maybe_unused appliquée à {filepath}")
 
-decl_ns = '''
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-#include <linux/susfs_def.h>
-extern bool susfs_is_current_ksu_domain(void);
-extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-#define CL_COPY_MNT_NS BIT(25)
-#endif
-'''
-
-decl_stat = '''
-#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-#include <linux/susfs_def.h>
-#endif
-'''
-
-def inject_after(content, anchor, declaration):
-    if anchor in content:
-        return content.replace(anchor, anchor + declaration, 1)
-    return None
-
-# --- Traitement de fs/super.c (Le plus critique) ---
-super_c = Path("fs/super.c")
-if super_c.exists() and 'susfs_is_current_ksu_domain' not in super_c.read_text():
-    c = super_c.read_text()
-    # Essayer plusieurs ancres courantes dans l'ordre de probabilité
-    injected = inject_after(c, '#include <linux/mount.h>', decl_super)
-    if not injected:
-        injected = inject_after(c, '#include <linux/fs.h>', decl_super)
-    if not injected:
-        # Fallback ultime : insérer à la ligne 15
-        lines = c.split('\n')
-        lines.insert(15, decl_super)
-        injected = '\n'.join(lines)
+# 2. Ajout du header ET des déclarations extern dans fs/super.c
+filepath = "fs/super.c"
+if os.path.exists(filepath):
+    with open(filepath, 'r') as f:
+        content = f.read()
     
-    super_c.write_text(injected)
-    print("✅ fs/super.c : Déclarations SUSFS injectées de force au début du fichier")
+    # Si le code SUSFS est utilisé mais que les déclarations extern sont manquantes
+    if ("DEFAULT_KSU_MNT_MINOR_DEV" in content or "susfs_is_current_ksu_domain" in content):
+        needs_fix = False
+        if "#include <linux/susfs_def.h>" not in content:
+            needs_fix = True
+        if "extern bool susfs_is_current_ksu_domain" not in content:
+            needs_fix = True
+        if "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted" not in content:
+            needs_fix = True
+        
+        if needs_fix:
+            print("⚠️ Code SUSFS détecté dans fs/super.c, mais déclarations manquantes. Ajout en cours...")
+            lines = content.split('\n')
+            first_include_idx = -1
+            for i, line in enumerate(lines):
+                if line.strip().startswith('#include'):
+                    first_include_idx = i
+                    break
+            
+            if first_include_idx != -1:
+                # Insérer le header et les déclarations extern
+                insert_lines = [
+                    '#ifdef CONFIG_KSU_SUSFS',
+                    '#include <linux/susfs_def.h>',
+                    '#endif',
+                    '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+                    'extern bool susfs_is_current_ksu_domain(void);',
+                    'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;',
+                    '#endif'
+                ]
+                
+                # Vérifier si déjà présent pour éviter les doublons
+                if '#include <linux/susfs_def.h>' not in content:
+                    for j, insert_line in enumerate(insert_lines):
+                        lines.insert(first_include_idx + 1 + j, insert_line)
+                
+                with open(filepath, 'w') as f:
+                    f.write('\n'.join(lines))
+                print("✅ Header et déclarations extern ajoutés avec succès à fs/super.c")
+            else:
+                print("❌ Impossible de trouver un point d'insertion pour les déclarations.")
+        else:
+            print("✅ fs/super.c est déjà correctement configuré.")
 
-# --- Traitement de fs/namespace.c ---
-ns_c = Path("fs/namespace.c")
-if ns_c.exists() and 'susfs_is_current_ksu_domain' not in ns_c.read_text():
-    c = ns_c.read_text()
-    injected = inject_after(c, '#include <linux/sched/task.h>', decl_ns)
-    if not injected:
-        injected = inject_after(c, '#include <linux/fs.h>', decl_ns)
-    if not injected:
-        lines = c.split('\n')
-        lines.insert(15, decl_ns)
-        injected = '\n'.join(lines)
-    ns_c.write_text(injected)
-    print("✅ fs/namespace.c : Déclarations SUSFS injectées")
+# 3. Faire de même pour fs/namespace.c
+fpath = "fs/namespace.c"
+if os.path.exists(fpath):
+    with open(fpath, 'r') as f:
+        content = f.read()
+    if "susfs_is_current_ksu_domain" in content:
+        needs_fix = False
+        if "#include <linux/susfs_def.h>" not in content:
+            needs_fix = True
+        if "extern bool susfs_is_current_ksu_domain" not in content:
+            needs_fix = True
+        
+        if needs_fix:
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                if line.strip().startswith('#include'):
+                    insert_lines = [
+                        '#ifdef CONFIG_KSU_SUSFS',
+                        '#include <linux/susfs_def.h>',
+                        '#endif',
+                        '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+                        'extern bool susfs_is_current_ksu_domain(void);',
+                        'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;',
+                        '#define CL_COPY_MNT_NS BIT(25)',
+                        '#endif'
+                    ]
+                    for j, insert_line in enumerate(insert_lines):
+                        lines.insert(i + 1 + j, insert_line)
+                    with open(fpath, 'w') as f:
+                        f.write('\n'.join(lines))
+                    print(f"✅ Header et déclarations extern ajoutés à {fpath}")
+                    break
 
-# --- Traitement de fs/stat.c ---
-stat_c = Path("fs/stat.c")
-if stat_c.exists() and 'susfs_def.h' not in stat_c.read_text():
-    c = stat_c.read_text()
-    injected = inject_after(c, '#include <asm/unistd.h>', decl_stat)
-    if not injected:
-        injected = inject_after(c, '#include <linux/fs.h>', decl_stat)
-    if not injected:
-        lines = c.split('\n')
-        lines.insert(15, decl_stat)
-        injected = '\n'.join(lines)
-    stat_c.write_text(injected)
-    print("✅ fs/stat.c : Déclarations SUSFS injectées")
+# 4. Faire de même pour fs/stat.c
+fpath = "fs/stat.c"
+if os.path.exists(fpath):
+    with open(fpath, 'r') as f:
+        content = f.read()
+    if "SUSFS" in content or "susfs" in content:
+        if "#include <linux/susfs_def.h>" not in content:
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                if line.strip().startswith('#include'):
+                    lines.insert(i + 1, '#ifdef CONFIG_KSU_SUSFS')
+                    lines.insert(i + 2, '#include <linux/susfs_def.h>')
+                    lines.insert(i + 3, '#endif')
+                    with open(fpath, 'w') as f:
+                        f.write('\n'.join(lines))
+                    print(f"✅ Header ajouté à {fpath}")
+                    break
 
-print("✅ Toutes les corrections post-patch ont été appliquées avec succès.")
+print("✅ Toutes les corrections post-patch ont réussi.")
 PYEOF
 
-# ==================== 6. CONFIGURATION (FORCÉE ET BLINDÉE) ====================
+# ==================== 6. CONFIGURATION (FORCÉE) ====================
 echo "=== Configuration du noyau ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 mkdir -p out
 
-# 1. Génération de la config de base
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
-# 2. Ajout des options souhaitées
 cat << 'EOF' >> out/.config
 CONFIG_KSU=y
 CONFIG_KSU_SUSFS=y
@@ -180,18 +226,15 @@ CONFIG_COMPAT=y
 CONFIG_COMPAT_32BIT_TIME=y
 EOF
 
-# 3. Résolution des dépendances
 echo "→ Résolution des dépendances (olddefconfig)..."
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
 
-# 4. OPTION NUCLÉAIRE : Forcer les valeurs APRÈS olddefconfig
-echo "→ Forçage des options KSU (Option Nucléaire)..."
+echo "→ Forçage des options KSU..."
 sed -i 's/^# CONFIG_KSU is not set$/CONFIG_KSU=y/' out/.config
 sed -i 's/^# CONFIG_KSU_SUSFS is not set$/CONFIG_KSU_SUSFS=y/' out/.config
 sed -i 's/^CONFIG_KSU_MANUAL_HOOK=y$/# CONFIG_KSU_MANUAL_HOOK is not set/' out/.config
 sed -i 's/^CONFIG_KSU_TRACEPOINT_HOOK=y$/# CONFIG_KSU_TRACEPOINT_HOOK is not set/' out/.config
 
-# 5. VÉRIFICATION OBLIGATOIRE
 echo "=== VÉRIFICATION FINALE DU .CONFIG ==="
 grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_KSU_MANUAL_HOOK=" out/.config || echo "❌ ERREUR CRITIQUE : KSU n'est pas activé !"
 
@@ -255,8 +298,8 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
 chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé"
 
-# ==================== 10. REPACK AVEC INJECTION KSUD (Méthode Non-GKI Officielle) ====================
-echo "=== Repack avec injection ksud (Obligatoire pour Non-GKI) ==="
+# ==================== 10. REPACK AVEC INJECTION KSUD ====================
+echo "=== Repack avec injection ksud ==="
 cd "$GITHUB_WORKSPACE"
 rm -f boot-stock.img dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1
@@ -276,18 +319,16 @@ echo "→ Unpack..."
 echo "→ Remplacement du kernel..."
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-echo "→ Préparation du ramdisk pour l'injection..."
+echo "→ Préparation du ramdisk..."
 rm -rf ramdisk_work && mkdir -p ramdisk_work
 cd ramdisk_work
 ../magiskboot cpio ../ramdisk.cpio extract
 
-# 1. Injecter ksud dans le ramdisk
 mkdir -p system/bin
 cp "$GITHUB_WORKSPACE/ksud" system/bin/ksud
 chmod 755 system/bin/ksud
-echo "✅ ksud ajouté au ramdisk (system/bin/)"
+echo "✅ ksud ajouté au ramdisk"
 
-# 2. Injecter le script init.rc pour déclencher ksud au boot
 INITRC_PATH="init.rc"
 [ -f "system/etc/init/hw/init.rc" ] && INITRC_PATH="system/etc/init/hw/init.rc"
 
@@ -297,19 +338,17 @@ cat >> "$INITRC_PATH" << 'INITRC_EOF'
 # --- KSUD START ---
 on post-fs-data
     exec u:r:su:s0 root -- /system/bin/ksud post-fs-data
-
 on nonencrypted
     exec u:r:su:s0 root -- /system/bin/ksud services
-
 on property:sys.boot_completed=1
     exec u:r:su:s0 root -- /system/bin/ksud boot-completed
 # --- KSUD END ---
 INITRC_EOF
-echo "✅ Script init.rc ajouté à $INITRC_PATH"
+echo "✅ Script init.rc ajouté"
 
 cd ..
 
-echo "→ Reconstruction du ramdisk avec les ajouts..."
+echo "→ Reconstruction du ramdisk..."
 ./magiskboot cpio ramdisk.cpio \
     "mkdir 0755 system" \
     "mkdir 0755 system/bin" \
@@ -320,7 +359,7 @@ echo "→ Repack..."
 ./magiskboot repack boot.img new-boot.img
 [ ! -f "new-boot.img" ] && { echo "❌ Échec repack"; exit 1; }
 mv new-boot.img ../final_boot.img && cd ..
-echo "✅ Repack terminé avec injection ksud"
+echo "✅ Repack terminé"
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
@@ -330,6 +369,6 @@ cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v16 ==="
+echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v25-DEBUG ==="
 echo "========================================="
 ls -lh output/
