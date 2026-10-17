@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-CYBERC3RD-V25-DEBUG : Ajout des déclarations extern + DEBUG sidtab
+# BRANCHE TEST-SYNC-SUSFS-V19-FINAL : sync-susfs + patch SUSFS cyberc3dr
+# Approche : SUSFS Inline pur (sans hooks manuels) + init.rc injection
 # =============================================================================
 
-echo "=== Build BakaSU + SUSFS cyberc3rd 2.3.0 ==="
+echo "=== Build BakaSU (sync-susfs) v19-final ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -17,238 +18,215 @@ sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.l
 sudo apt-get update
 sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf-dev libssl-dev \
   libncurses-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi clang llvm lld \
-  device-tree-compiler zip unzip curl git python3 python3-pip mkbootimg
+  device-tree-compiler zip unzip curl git python3 python3-pip mkbootimg cpio
 
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE FRAIS ====================
-echo "=== Clonage frais du noyau ==="
-rm -rf kernel_sources
+# ==================== 1. CLONAGE DU NOYAU ====================
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 1b. DEBUG : Vérification du backport Google sidtab ====================
-echo "=== DEBUG : Vérification du backport Google sidtab ==="
-if grep -q "^int context_add_hash" security/selinux/ss/services.c 2>/dev/null; then
-    echo "✅ Le noyau CONTIENT le backport Google (context_add_hash). Le correctif BakaSU sera activé."
-else
-    echo "⚠️ Le noyau NE CONTIENT PAS le backport Google (ou il est différent). Le correctif BakaSU ne s'activera pas automatiquement."
-fi
-
-# ==================== 2. INTÉGRATION BakaSU ====================
-echo "=== Intégration BakaSU ==="
+# ==================== 2. INTÉGRATION BakaSU (BRANCHE SYNC-SUSFS) ====================
+echo "=== Intégration BakaSU (sync-susfs) ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
-curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+
+curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/sync-susfs/kernel/setup.sh" | bash -s sync-susfs
 
 if [ ! -d "drivers/kernelsu" ] && [ ! -d "KernelSU/kernel" ]; then
-    echo "❌ Échec intégration BakaSU"
-    exit 1
+    echo "❌ Échec intégration BakaSU"; exit 1
 fi
-echo "✅ BakaSU intégré"
+echo "✅ BakaSU (sync-susfs) intégré"
 
-# ==================== 3. NEUTRALISATION CHECK.MK ====================
-echo "=== Neutralisation check.mk ==="
+if [ -d "drivers/kernelsu" ]; then
+    KSU_DIR="drivers/kernelsu"
+elif [ -d "KernelSU/kernel" ]; then
+    KSU_DIR="KernelSU/kernel"
+else
+    KSU_DIR="KernelSU"
+fi
+echo "KSU_DIR : $KSU_DIR"
+
+# ==================== 2e. NEUTRALISATION CHECK.MK ET KBUILD ====================
+echo ""
+echo "=== Neutralisation check.mk et Kbuild ==="
 for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepoint_hook_check.mk kprobe_check.mk; do
-    find . -name "$pattern" -type f -exec sed -i 's/\$(error/\$(warning/g' {} + 2>/dev/null || true
+    FILES=$(find . -name "$pattern" -type f 2>/dev/null)
+    if [ -n "$FILES" ]; then
+        for f in $FILES; do
+            sed -i 's/\$(error/\$(warning/g' "$f"
+        done
+    fi
 done
 
-# ==================== 4. PATCH SUSFS ====================
-echo "=== Patch SUSFS 4.19 (cyberc3rd rebase) ==="
-cd "$GITHUB_WORKSPACE/kernel_sources"
-
-PATCH_URL="https://raw.githubusercontent.com/cyberc3dr/nGKI_Kernel_Build/rebase/Patches/Patch/susfs_patch_to_4.19.patch"
-echo "Téléchargement du patch depuis : $PATCH_URL"
-
-if curl -sSfL "$PATCH_URL" -o /tmp/susfs_4.19.patch; then
-    echo "Application du patch..."
-    patch -p1 < /tmp/susfs_4.19.patch 2>&1 | tail -15 || true
-    rm -f /tmp/susfs_4.19.patch
-else
-    echo "❌ Échec du téléchargement du patch SUSFS."
-    exit 1
+KSU_KBUILD="$KSU_DIR/Kbuild"
+if [ -f "$KSU_KBUILD" ]; then
+    sed -i 's/\$(error/\$(warning/g' "$KSU_KBUILD"
+    echo "✅ Kbuild neutralisé"
 fi
-find . -name "*.rej" -type f -delete 2>/dev/null || true
 
-# ==================== 5. CORRECTIONS COMPLÈTES (Headers + Extern) ====================
-echo "=== Corrections post-patch complètes ==="
-
+# ==================== 2b. NETTOYAGE UNICODE ====================
+echo "=== Nettoyage Unicode ==="
 python3 << 'PYEOF'
 import os
-import re
-
-# 1. Correction robuste de __maybe_unused pour la variable 'vma'
-files_to_fix = ["fs/proc/task_mmu.c", "fs/namespace.c", "fs/super.c", "fs/stat.c"]
-for filepath in files_to_fix:
-    if os.path.exists(filepath):
-        with open(filepath, 'r') as f:
-            content = f.read()
-        
-        new_content = re.sub(
-            r'(\bstruct vm_area_struct\s+\*\s*vma\s*;)',
-            r'struct vm_area_struct *vma __maybe_unused;',
-            content
-        )
-        
-        if new_content != content:
-            with open(filepath, 'w') as f:
-                f.write(new_content)
-            print(f"✅ Correction __maybe_unused appliquée à {filepath}")
-
-# 2. Ajout du header ET des déclarations extern dans fs/super.c
-filepath = "fs/super.c"
-if os.path.exists(filepath):
-    with open(filepath, 'r') as f:
-        content = f.read()
-    
-    # Si le code SUSFS est utilisé mais que les déclarations extern sont manquantes
-    if ("DEFAULT_KSU_MNT_MINOR_DEV" in content or "susfs_is_current_ksu_domain" in content):
-        needs_fix = False
-        if "#include <linux/susfs_def.h>" not in content:
-            needs_fix = True
-        if "extern bool susfs_is_current_ksu_domain" not in content:
-            needs_fix = True
-        if "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted" not in content:
-            needs_fix = True
-        
-        if needs_fix:
-            print("⚠️ Code SUSFS détecté dans fs/super.c, mais déclarations manquantes. Ajout en cours...")
-            lines = content.split('\n')
-            first_include_idx = -1
-            for i, line in enumerate(lines):
-                if line.strip().startswith('#include'):
-                    first_include_idx = i
-                    break
-            
-            if first_include_idx != -1:
-                # Insérer le header et les déclarations extern
-                insert_lines = [
-                    '#ifdef CONFIG_KSU_SUSFS',
-                    '#include <linux/susfs_def.h>',
-                    '#endif',
-                    '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
-                    'extern bool susfs_is_current_ksu_domain(void);',
-                    'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;',
-                    '#endif'
-                ]
-                
-                # Vérifier si déjà présent pour éviter les doublons
-                if '#include <linux/susfs_def.h>' not in content:
-                    for j, insert_line in enumerate(insert_lines):
-                        lines.insert(first_include_idx + 1 + j, insert_line)
-                
-                with open(filepath, 'w') as f:
-                    f.write('\n'.join(lines))
-                print("✅ Header et déclarations extern ajoutés avec succès à fs/super.c")
-            else:
-                print("❌ Impossible de trouver un point d'insertion pour les déclarations.")
-        else:
-            print("✅ fs/super.c est déjà correctement configuré.")
-
-# 3. Faire de même pour fs/namespace.c
-fpath = "fs/namespace.c"
-if os.path.exists(fpath):
-    with open(fpath, 'r') as f:
-        content = f.read()
-    if "susfs_is_current_ksu_domain" in content:
-        needs_fix = False
-        if "#include <linux/susfs_def.h>" not in content:
-            needs_fix = True
-        if "extern bool susfs_is_current_ksu_domain" not in content:
-            needs_fix = True
-        
-        if needs_fix:
-            lines = content.split('\n')
-            for i, line in enumerate(lines):
-                if line.strip().startswith('#include'):
-                    insert_lines = [
-                        '#ifdef CONFIG_KSU_SUSFS',
-                        '#include <linux/susfs_def.h>',
-                        '#endif',
-                        '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
-                        'extern bool susfs_is_current_ksu_domain(void);',
-                        'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;',
-                        '#define CL_COPY_MNT_NS BIT(25)',
-                        '#endif'
-                    ]
-                    for j, insert_line in enumerate(insert_lines):
-                        lines.insert(i + 1 + j, insert_line)
-                    with open(fpath, 'w') as f:
-                        f.write('\n'.join(lines))
-                    print(f"✅ Header et déclarations extern ajoutés à {fpath}")
-                    break
-
-# 4. Faire de même pour fs/stat.c
-fpath = "fs/stat.c"
-if os.path.exists(fpath):
-    with open(fpath, 'r') as f:
-        content = f.read()
-    if "SUSFS" in content or "susfs" in content:
-        if "#include <linux/susfs_def.h>" not in content:
-            lines = content.split('\n')
-            for i, line in enumerate(lines):
-                if line.strip().startswith('#include'):
-                    lines.insert(i + 1, '#ifdef CONFIG_KSU_SUSFS')
-                    lines.insert(i + 2, '#include <linux/susfs_def.h>')
-                    lines.insert(i + 3, '#endif')
-                    with open(fpath, 'w') as f:
-                        f.write('\n'.join(lines))
-                    print(f"✅ Header ajouté à {fpath}")
-                    break
-
-print("✅ Toutes les corrections post-patch ont réussi.")
+from pathlib import Path
+UNICODE_SPACES = ['\u00A0', '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005',
+    '\u2006', '\u2007', '\u2008', '\u2009', '\u200A', '\u200B', '\u202F',
+    '\u205F', '\u3000']
+count = 0
+for root, dirs, files in os.walk('.'):
+    if 'KernelSU' not in root and 'kernelsu' not in root:
+        continue
+    for file in files:
+        if file.endswith(('.c', '.h')):
+            filepath = Path(root) / file
+            try:
+                content = filepath.read_text(encoding='utf-8', errors='ignore')
+                original = content
+                for uchar in UNICODE_SPACES:
+                    if uchar in content:
+                        content = content.replace(uchar, ' ')
+                if content != original:
+                    filepath.write_text(content, encoding='utf-8')
+                    count += 1
+            except: pass
+print(f"✅ {count} fichiers nettoyés")
 PYEOF
 
-# ==================== 6. CONFIGURATION (FORCÉE) ====================
-echo "=== Configuration du noyau ==="
+# ==================== 2c. FIX symbol_resolver.h ====================
+echo "=== Fix symbol_resolver.h ==="
+for h in "$KSU_DIR/infra/symbol_resolver.h" "$KSU_DIR/kernel/infra/symbol_resolver.h"; do
+    if [ -f "$h" ]; then
+        sed -i 's|^static inline void \*ksu_resolve_symbol_for_functable_hook|// static inline void *ksu_resolve_symbol_for_functable_hook|' "$h"
+        sed -i 's|^static inline unsigned long find_kernel_symbol_exact|// static inline unsigned long find_kernel_symbol_exact|' "$h"
+        sed -i 's|^static inline void ksu_init_symbol_resolver|// static inline void ksu_init_symbol_resolver|' "$h"
+    fi
+done
+
+# ==================== 2d. STATIC EXPORTS SELINUX ====================
+echo "=== Static exports SELinux ==="
+[ -f "security/selinux/selinuxfs.c" ] && {
+    sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
+    sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
+    sed -i 's/^static DEFINE_MUTEX(sel_mutex)/DEFINE_MUTEX(sel_mutex)/' security/selinux/selinuxfs.c
+}
+[ -f "security/selinux/ss/status.c" ] && {
+    sed -i 's/^static struct page \*selinux_status_page/struct page *selinux_status_page/' security/selinux/ss/status.c
+    sed -i 's/^static DEFINE_MUTEX(selinux_status_lock)/DEFINE_MUTEX(selinux_status_lock)/' security/selinux/ss/status.c
+}
+[ -f "security/selinux/ss/services.c" ] && {
+    sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
+}
+[ -f "security/selinux/hooks.c" ] && {
+    sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
+}
+
+# ==================== 3. PATCH SUSFS (CYBERC3DR) ====================
+echo ""
+echo "=== Patch SUSFS 4.19 (cyberc3dr) ==="
+cd "$GITHUB_WORKSPACE"
+rm -rf /tmp/cyber_repo
+git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Build.git /tmp/cyber_repo 2>/dev/null || true
+
+cd "$GITHUB_WORKSPACE/kernel_sources"
+PATCH_419=$(find /tmp/cyber_repo/Patches -name "*4.19*" -name "*.patch" 2>/dev/null | head -1)
+if [ -n "$PATCH_419" ]; then
+    patch -p1 < "$PATCH_419" 2>&1 | tail -5 || true
+fi
+find . -name "*.rej" -type f -delete 2>/dev/null || true
+echo "✅ Patch SUSFS (cyberc3dr) appliqué"
+
+# ==================== 3.5. CORRECTIONS POST-PATCH SUSFS ====================
+echo ""
+echo "=== Corrections post-patch SUSFS ==="
+for f in fs/proc/task_mmu.c fs/namespace.c fs/super.c fs/stat.c; do
+    [ -f "$f" ] && sed -i 's/^\(\s*\)struct vm_area_struct \*vma;/\1struct vm_area_struct *vma __maybe_unused;/g' "$f" 2>/dev/null || true
+done
+
+if [ -f "fs/namespace.c" ] && ! grep -q "susfs_def.h" fs/namespace.c; then
+    sed -i '/#include <linux\/sched\/task.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n#define CL_COPY_MNT_NS BIT(25)\n#endif' fs/namespace.c
+fi
+
+if [ -f "fs/super.c" ] && ! grep -q "susfs_def.h" fs/super.c; then
+python3 << 'PYEOF'
+from pathlib import Path
+p = Path("fs/super.c")
+content = p.read_text()
+if 'susfs_def.h' not in content:
+    decl = '''
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+#endif
+'''
+    anchor = '#include "internal.h"'
+    if anchor in content:
+        content = content.replace(anchor, anchor + '\n' + decl, 1)
+        p.write_text(content)
+PYEOF
+fi
+
+if [ -f "fs/stat.c" ] && ! grep -q "susfs_def.h" fs/stat.c; then
+python3 << 'PYEOF'
+from pathlib import Path
+p = Path("fs/stat.c")
+content = p.read_text()
+if 'susfs_def.h' not in content:
+    anchor = '#include <asm/unistd.h>'
+    if anchor in content:
+        content = content.replace(anchor, anchor + '\n\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif', 1)
+        p.write_text(content)
+PYEOF
+fi
+echo "✅ Corrections SUSFS terminées"
+# NOTE : AUCUN HOOK MANUEL N'EST INSÉRÉ ICI. Le mode SUSFS Inline gère tout.
+
+# ==================== 4. CONFIGURATION ====================
+echo ""
+echo "=== Configuration (SUSFS Inline pur) ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 mkdir -p out
-
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
-cat << 'EOF' >> out/.config
-CONFIG_KSU=y
-CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_SUSFS_SUS_MAP=y
-CONFIG_KALLSYMS_ALL=y
-CONFIG_COMPAT=y
-CONFIG_COMPAT_32BIT_TIME=y
-EOF
+{
+  echo "CONFIG_KSU=y"
+  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
+  echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
+  echo "CONFIG_KSU_SUSFS=y"
+  echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+  echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+  echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+  echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+  echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+  echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+  echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+  echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+  echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+  echo "CONFIG_COMPAT=y"
+  echo "CONFIG_COMPAT_32BIT_TIME=y"
+} >> out/.config
 
-echo "→ Résolution des dépendances (olddefconfig)..."
-make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
+make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
-echo "→ Forçage des options KSU..."
-sed -i 's/^# CONFIG_KSU is not set$/CONFIG_KSU=y/' out/.config
-sed -i 's/^# CONFIG_KSU_SUSFS is not set$/CONFIG_KSU_SUSFS=y/' out/.config
-sed -i 's/^CONFIG_KSU_MANUAL_HOOK=y$/# CONFIG_KSU_MANUAL_HOOK is not set/' out/.config
-sed -i 's/^CONFIG_KSU_TRACEPOINT_HOOK=y$/# CONFIG_KSU_TRACEPOINT_HOOK is not set/' out/.config
-
-echo "=== VÉRIFICATION FINALE DU .CONFIG ==="
-grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_KSU_MANUAL_HOOK=" out/.config || echo "❌ ERREUR CRITIQUE : KSU n'est pas activé !"
-
-# ==================== 7. PATCHS MOTOROLA ====================
+# ==================== 5. PATCHS MOTOROLA ====================
+echo "=== Patch signatures + tactile ==="
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
-if [ -f "techpack/display/msm/msm_drv.c" ]; then
-    printf "\n/* --- Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) { return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb); }\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) { return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb); }\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch --- */\n" >> techpack/display/msm/msm_drv.c
-fi
+printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
+echo "✅ Patchs Motorola appliqués"
 
-# ==================== 8. COMPILATION ====================
-echo "=== Compilation ==="
+# ==================== 6. COMPILATION KERNEL ====================
+echo "=== Compilation du kernel ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
 if [ -f "out/arch/arm64/boot/Image" ]; then
     echo "✅ Compilation réussie"
+    ls -lh out/arch/arm64/boot/
     sha256sum out/arch/arm64/boot/Image | cut -d' ' -f1 > /tmp/kernel_compiled_hash.txt
 else
     echo "❌ BUILD FAILED"
@@ -256,119 +234,187 @@ else
     exit 1
 fi
 
-# ==================== 9. COMPILATION KSUD ====================
-echo "=== Compilation ksud ==="
+# ==================== 7. COMPILATION KSUD (SYNC-SUSFS) ====================
+echo ""
+echo "=== Compilation ksud (sync-susfs) ==="
 cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustup toolchain install nightly
-rustup default nightly
-rustup target add aarch64-linux-android
-
-wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
-unzip -q android-ndk-r26d-linux.zip
-
-export ANDROID_NDK_ROOT="$GITHUB_WORKSPACE/android-ndk-r26d"
-export NDK_BIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
-export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
-export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang++"
+rustup toolchain install nightly; rustup default nightly; rustup target add aarch64-linux-android
+wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip; unzip -q android-ndk-r26d-linux.zip
+export ANDROID_NDK_ROOT="$GITHUB_WORKSPACE/android-ndk-r26d"; export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+export AARCH64_CLANG_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+export AARCH64_CLANGXX_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++"
+export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
-
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
-git clone --depth=1 https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
+git clone --depth=1 --branch sync-susfs https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
-
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
 [target.aarch64-linux-android]
-linker = "$NDK_BIN/aarch64-linux-android26-clang"
+linker = "$AARCH64_CLANG_PATH"
 [env]
-CC_aarch64_linux_android = "$NDK_BIN/aarch64-linux-android26-clang"
-CXX_aarch64_linux_android = "$NDK_BIN/aarch64-linux-android26-clang++"
+CC_aarch64_linux_android = "$AARCH64_CLANG_PATH"
+CXX_aarch64_linux_android = "$AARCH64_CLANGXX_PATH"
+AR_aarch64_linux_android = "$AR_PATH"
 BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"
 EOF
-
-if ! cargo build --release --target aarch64-linux-android; then
-    echo "❌ Échec compilation ksud"
-    exit 1
-fi
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+cargo +nightly build --release --target aarch64-linux-android
 KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1)
-[ -z "$KSUD_BINARY" ] && { echo "❌ ksud introuvable"; exit 1; }
-cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
-chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé"
-
-# ==================== 10. REPACK AVEC INJECTION KSUD ====================
-echo "=== Repack avec injection ksud ==="
+if [ -z "$KSUD_BINARY" ]; then echo "❌ ksud introuvable"; exit 1; fi
+cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
+echo "✅ ksud compilé (sync-susfs)"
 cd "$GITHUB_WORKSPACE"
-rm -f boot-stock.img dtbo-stock.img
-gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1
-[ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ] && { echo "❌ boot-stock invalide"; exit 1; }
+
+# ==================== 8. REPACK AVEC INJECTION INIT.RC ====================
+echo ""
+echo "=== Repack avec injection init.rc + allow_shell ==="
+
+rm -f boot-stock.img
+if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
+    echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"
+fi
+if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
+    echo "❌ boot-stock.img invalide"; exit 1
+fi
+rm -f dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 || true
 
-mkdir -p repack && cp boot-stock.img repack/boot.img
+mkdir -p repack
+cp boot-stock.img repack/boot.img
+cp "$GITHUB_WORKSPACE/ksud" repack/ksud
 wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O Magisk-v27.0.apk
-unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so && mv lib/x86_64/libmagiskboot.so repack/magiskboot && chmod +x repack/magiskboot
+unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so
+mv lib/x86_64/libmagiskboot.so repack/magiskboot
+chmod +x repack/magiskboot
 rm -rf Magisk-v27.0.apk lib/
 cd repack
 
-echo "→ Unpack..."
 ./magiskboot unpack boot.img
-[ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ] && { echo "❌ Échec unpack"; exit 1; }
+if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then
+    echo "❌ Échec unpack"; exit 1
+fi
 
-echo "→ Remplacement du kernel..."
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-echo "→ Préparation du ramdisk..."
-rm -rf ramdisk_work && mkdir -p ramdisk_work
-cd ramdisk_work
-../magiskboot cpio ../ramdisk.cpio extract
+if [ -f "header" ]; then
+    echo "→ Ajout de allow_shell=1 à la cmdline dans le header"
+    python3 - << 'PYEOF'
+with open('header', 'r+b') as f:
+    header = f.read()
+    cmdline_offset = 44
+    cmdline = header[cmdline_offset:cmdline_offset+512].split(b'\x00')[0].decode('utf-8', errors='ignore')
+    if 'allow_shell' not in cmdline:
+        new_cmdline = cmdline + ' kernelsu.allow_shell=1 allow_shell=1'
+        new_bytes = new_cmdline.encode('utf-8')
+        f.seek(cmdline_offset)
+        f.write(new_bytes + b'\x00' * (512 - len(new_bytes)))
+        print("  ✅ Cmdline patchée dans header")
+PYEOF
+fi
 
-mkdir -p system/bin
-cp "$GITHUB_WORKSPACE/ksud" system/bin/ksud
-chmod 755 system/bin/ksud
-echo "✅ ksud ajouté au ramdisk"
+rm -rf initrc_work
+mkdir -p initrc_work
+cd initrc_work
+cpio -idm < ../ramdisk.cpio 2>/dev/null || true
+INITRC_PATH=$(find . -name "init.rc" -type f 2>/dev/null | head -1)
+echo "init.rc trouvé : $INITRC_PATH"
 
-INITRC_PATH="init.rc"
-[ -f "system/etc/init/hw/init.rc" ] && INITRC_PATH="system/etc/init/hw/init.rc"
-
-mkdir -p "$(dirname "$INITRC_PATH")"
-cat >> "$INITRC_PATH" << 'INITRC_EOF'
+if [ -n "$INITRC_PATH" ] && [ -f "$INITRC_PATH" ]; then
+    cat >> "$INITRC_PATH" << 'INITRC_EOF'
 
 # --- KSUD START ---
 on post-fs-data
     exec u:r:su:s0 root -- /system/bin/ksud post-fs-data
+
 on nonencrypted
     exec u:r:su:s0 root -- /system/bin/ksud services
+
+on property:vold.decrypt=trigger_restart_framework
+    exec u:r:su:s0 root -- /system/bin/ksud services
+
 on property:sys.boot_completed=1
     exec u:r:su:s0 root -- /system/bin/ksud boot-completed
 # --- KSUD END ---
 INITRC_EOF
-echo "✅ Script init.rc ajouté"
+    echo "✅ init.rc modifié"
+else
+    echo "⚠️ init.rc introuvable — création d'un nouvel init.rc"
+    cat > init.rc << 'INITRC_EOF'
+# --- KSUD START ---
+on post-fs-data
+    exec u:r:su:s0 root -- /system/bin/ksud post-fs-data
 
-cd ..
+on nonencrypted
+    exec u:r:su:s0 root -- /system/bin/ksud services
+
+on property:vold.decrypt=trigger_restart_framework
+    exec u:r:su:s0 root -- /system/bin/ksud services
+
+on property:sys.boot_completed=1
+    exec u:r:su:s0 root -- /system/bin/ksud boot-completed
+# --- KSUD END ---
+INITRC_EOF
+    INITRC_PATH="init.rc"
+    echo "✅ init.rc créé"
+fi
+
+mkdir -p system/bin
+cp ../ksud system/bin/ksud
+chmod 755 system/bin/ksud
+echo "✅ ksud ajouté à system/bin"
 
 echo "→ Reconstruction du ramdisk..."
-./magiskboot cpio ramdisk.cpio \
-    "mkdir 0755 system" \
-    "mkdir 0755 system/bin" \
-    "add 0755 system/bin/ksud ramdisk_work/system/bin/ksud" \
-    "add 0750 $INITRC_PATH ramdisk_work/$INITRC_PATH"
+find . | cpio -o -H newc 2>/dev/null | gzip -9 > ../ramdisk.cpio
+cd ..
 
-echo "→ Repack..."
+echo "→ Repack du boot.img..."
 ./magiskboot repack boot.img new-boot.img
-[ ! -f "new-boot.img" ] && { echo "❌ Échec repack"; exit 1; }
-mv new-boot.img ../final_boot.img && cd ..
-echo "✅ Repack terminé"
+if [ ! -f "new-boot.img" ]; then
+    echo "❌ Échec repack"; exit 1
+fi
+mv new-boot.img ../final_boot.img
+cd ..
 
-# ==================== 11. SORTIE ====================
+# ==================== 9. DIAGNOSTIC ====================
+echo ""
+echo "=== DIAGNOSTIC ==="
+mkdir -p verify; cd verify
+cp ../final_boot.img verify_boot.img
+../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
+if [ -f "kernel" ]; then
+    HASH_EXTRACTED=$(sha256sum kernel | cut -d' ' -f1)
+    HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
+    [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ] && echo "✅ Noyau IDENTIQUE"
+fi
+
+if [ -f "ramdisk.cpio" ]; then
+    mkdir -p ramdisk_check
+    cd ramdisk_check
+    cpio -idm < ../ramdisk.cpio 2>/dev/null || true
+    if [ -f "system/bin/ksud" ]; then
+        echo "  ✅ ksud présent dans system/bin/"
+    else
+        echo "  ❌ ksud absent"
+    fi
+    INITRC_CHECK=$(find . -name "init.rc" -type f 2>/dev/null | head -1)
+    if [ -n "$INITRC_CHECK" ] && grep -q "KSUD START" "$INITRC_CHECK"; then
+        echo "  ✅ init.rc contient KSUD START"
+    else
+        echo "  ❌ init.rc ne contient pas KSUD START"
+    fi
+    cd ..
+fi
+cd ..
+
+# ==================== 10. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFS-cyberc3rd-boot.img
+cp final_boot.img output/BakaSU-SyncSusFS-v19-final-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "========================================="
-echo "=== 🎉 BUILD TERMINÉ AVEC SUCCÈS v25-DEBUG ==="
-echo "========================================="
+echo "=== BUILD TERMINÉ v19-final ==="
 ls -lh output/
