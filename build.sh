@@ -2,12 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SELINUX-FIX-V13 : SUSFS Inline + Forçage KSU_COMPAT_HAS_CONTEXT_ADD_HASH
+# BRANCHE TEST-FINAL-V15 : SUSFS Inline + Fix SELinux SIDTAB + ksud + init.rc
 # Source : Baka-SU/BakaSU officiel
-# Fix    : BakaSU#623 — forcer le flag pour activer le correctif SIDTAB
 # =============================================================================
 
-echo "=== Build BakaSU + Fix SELinux sidtab (v13) ==="
+echo "=== Build BakaSU Final v15 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -66,17 +65,14 @@ echo "=== Forçage du flag KSU_COMPAT_HAS_CONTEXT_ADD_HASH ==="
 
 KCOMPAT_MK="$KSU_DIR/tools/kernel_compat.mk"
 if [ -f "$KCOMPAT_MK" ]; then
-    # Ajouter le flag de force à la fin du fichier, s'il n'y est pas déjà
     if ! grep -q "FORCE_CONTEXT_ADD_HASH" "$KCOMPAT_MK"; then
         echo "" >> "$KCOMPAT_MK"
-        echo "# Fix forced by script (V13) to ensure context_add_hash is called" >> "$KCOMPAT_MK"
+        echo "# Fix forced by script (V15) to ensure context_add_hash is called" >> "$KCOMPAT_MK"
         echo "ccflags-y += -DKSU_COMPAT_HAS_CONTEXT_ADD_HASH" >> "$KCOMPAT_MK"
         echo "✅ Flag forcé dans $KCOMPAT_MK"
     else
         echo "[i] Flag déjà forcé"
     fi
-else
-    echo "⚠️  $KCOMPAT_MK introuvable"
 fi
 
 # ==================== 2b. NETTOYAGE UNICODE ====================
@@ -194,7 +190,7 @@ if 'susfs_def.h' not in content:
 PYEOF
 fi
 
-# ==================== 5. INJECTION DES 3 HOOKS SOURCES (SUSFS INLINE) ====================
+# ==================== 5. INJECTION DES 3 HOOKS SOURCES ====================
 echo ""
 echo "=== Injection des hooks sources (SUSFS Inline) ==="
 
@@ -326,17 +322,14 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
-echo "=== État final .config ==="
-grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KPROBES" out/.config | head -20 || true
-
 # ==================== 7. PATCHS MOTOROLA ====================
 echo "=== Patch signatures + tactile ==="
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
 echo "✅ Patchs Motorola appliqués"
 
-# ==================== 8. COMPILATION ====================
-echo "=== Compilation ==="
+# ==================== 8. COMPILATION KERNEL ====================
+echo "=== Compilation du kernel ==="
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image 2>&1 | tee build.log
 if [ -f "out/arch/arm64/boot/Image" ]; then
     echo "✅ Compilation réussie"
@@ -354,72 +347,86 @@ echo "=== Compilation ksud ==="
 cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustup toolchain install nightly 2>/dev/null || true
-rustup default nightly 2>/dev/null || true
-rustup target add aarch64-linux-android 2>/dev/null || true
-
-wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
-unzip -q android-ndk-r26d-linux.zip
-
-export ANDROID_NDK_ROOT="$GITHUB_WORKSPACE/android-ndk-r26d"
-export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+rustup toolchain install nightly; rustup default nightly; rustup target add aarch64-linux-android
+wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip; unzip -q android-ndk-r26d-linux.zip
+export ANDROID_NDK_ROOT="$GITHUB_WORKSPACE/android-ndk-r26d"; export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
 export AARCH64_CLANG_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
 export AARCH64_CLANGXX_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++"
 export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
-
 rm -rf "$GITHUB_WORKSPACE/ksud-src"
 git clone --depth=1 https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
-
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
 [target.aarch64-linux-android]
 linker = "$AARCH64_CLANG_PATH"
-
 [env]
 CC_aarch64_linux_android = "$AARCH64_CLANG_PATH"
 CXX_aarch64_linux_android = "$AARCH64_CLANGXX_PATH"
 AR_aarch64_linux_android = "$AR_PATH"
 BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"
 EOF
-
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
-cargo +nightly build --release --target aarch64-linux-android 2>&1 | tail -5
-
+cargo +nightly build --release --target aarch64-linux-android
 KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1)
-if [ -z "$KSUD_BINARY" ]; then
-    echo "❌ ksud introuvable"; exit 1
-fi
-cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"
-chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé : $(du -h $GITHUB_WORKSPACE/ksud | cut -f1)"
-
-# ==================== 10. REPACK + INJECTION INIT.RC ====================
-echo ""
-echo "=== Repack avec injection init.rc ==="
+if [ -z "$KSUD_BINARY" ]; then echo "❌ ksud introuvable"; exit 1; fi
+cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
+echo "✅ ksud compilé"
 cd "$GITHUB_WORKSPACE"
-rm -f boot-stock.img dtbo-stock.img
-gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1
-if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
-    echo "❌ boot-stock invalide"; exit 1
+
+# ==================== 10. REPACK AVEC INJECTION INIT.RC ET ALLOW_SHELL ====================
+echo ""
+echo "=== Repack avec injection init.rc + allow_shell ==="
+
+rm -f boot-stock.img
+if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
+    echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"
 fi
+if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
+    echo "❌ boot-stock.img invalide"; exit 1
+fi
+rm -f dtbo-stock.img
 gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 || true
 
-mkdir -p repack; cp boot-stock.img repack/boot.img
+mkdir -p repack
+cp boot-stock.img repack/boot.img
+cp "$GITHUB_WORKSPACE/ksud" repack/ksud
 wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O Magisk-v27.0.apk
 unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so
 mv lib/x86_64/libmagiskboot.so repack/magiskboot
 chmod +x repack/magiskboot
 rm -rf Magisk-v27.0.apk lib/
 cd repack
+
 ./magiskboot unpack boot.img
 if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then
     echo "❌ Échec unpack"; exit 1
 fi
+
+echo ""
+echo "→ Format du noyau original :"
+file kernel 2>/dev/null || true
+head -c 4 kernel | xxd | head -1
+
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-# Extraire et modifier init.rc
+# Ajout des paramètres allow_shell à la cmdline
+echo "→ Ajout de allow_shell=1 à la cmdline"
+if [ -f "bootimg.cfg" ]; then
+    if ! grep -q "allow_shell" bootimg.cfg; then
+        sed -i 's/^cmdline = \(.*\)$/cmdline = \1 kernelsu.allow_shell=1 allow_shell=1/' bootimg.cfg
+        echo "  ✅ bootimg.cfg modifié :"
+        grep "^cmdline" bootimg.cfg
+    else
+        echo "  [i] allow_shell déjà présent"
+    fi
+else
+    echo "  ⚠️ bootimg.cfg absent"
+fi
+
+# Extraire init.rc pour le modifier
+rm -rf initrc_work
 mkdir -p initrc_work
 cd initrc_work
 ../magiskboot cpio ../ramdisk.cpio extract 2>/dev/null || true
@@ -456,17 +463,27 @@ INITRC_EOF
 fi
 cd ..
 
-# Ajouter ksud dans /system/bin/
+# Ajouter ksud dans /system/bin/ du ramdisk
+echo "→ Ajout de ksud dans /system/bin/..."
 ./magiskboot cpio ramdisk.cpio "mkdir 0755 system" 2>/dev/null || true
 ./magiskboot cpio ramdisk.cpio "mkdir 0755 system/bin" 2>/dev/null || true
-./magiskboot cpio ramdisk.cpio "add 0755 system/bin/ksud $GITHUB_WORKSPACE/ksud" 2>/dev/null || true
+./magiskboot cpio ramdisk.cpio "add 0755 system/bin/ksud ksud" 2>&1 || {
+    echo "❌ Échec ajout ksud"; exit 1; }
+echo "  ✅ ksud ajouté"
 
 # Remettre init.rc modifié
 if [ -n "$INITRC_PATH" ]; then
-    ./magiskboot cpio ramdisk.cpio "add 0750 $INITRC_PATH initrc_work/$INITRC_PATH" 2>/dev/null || true
+    echo "→ Ajout de init.rc modifié..."
+    ./magiskboot cpio ramdisk.cpio "add 0750 $INITRC_PATH initrc_work/$INITRC_PATH" 2>&1 || {
+        echo "❌ Échec ajout init.rc"; exit 1; }
+    echo "  ✅ init.rc ajouté"
 fi
 
+echo "→ Repack du boot.img..."
 ./magiskboot repack boot.img new-boot.img
+if [ ! -f "new-boot.img" ]; then
+    echo "❌ Échec repack"; exit 1
+fi
 mv new-boot.img ../final_boot.img
 cd ..
 
@@ -480,8 +497,6 @@ if [ -f "kernel" ]; then
     HASH_EXTRACTED=$(sha256sum kernel | cut -d' ' -f1)
     HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
     [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ] && echo "✅ Noyau IDENTIQUE"
-    strings kernel | grep -q "KSU_COMPAT_HAS_CONTEXT_ADD_HASH" && echo "  ✅ Fix SIDTAB présent"
-    strings kernel | grep -q "ksu_handle_sys_read" && echo "  ✅ ksu_handle_sys_read présent"
 fi
 
 # Vérifier ksud dans le ramdisk
@@ -491,20 +506,39 @@ if [ -f "ramdisk.cpio" ]; then
     ../repack/magiskboot cpio ../ramdisk.cpio extract 2>/dev/null || true
     if [ -f "system/bin/ksud" ]; then
         echo "  ✅ ksud présent dans system/bin/"
+        ls -la system/bin/ksud
     else
         echo "  ❌ ksud absent"
+        echo "  → Liste des fichiers extraits :"
+        find . -type f | head -20
+    fi
+    if [ -n "$INITRC_PATH" ] && [ -f "$INITRC_PATH" ]; then
+        if grep -q "KSUD START" "$INITRC_PATH"; then
+            echo "  ✅ init.rc contient KSUD START"
+        else
+            echo "  ❌ init.rc ne contient pas KSUD START"
+        fi
     fi
     cd ..
+fi
+
+# Vérifier le flag dans kernel_compat.mk
+echo ""
+echo "→ Vérification du flag SIDTAB :"
+if grep -q "KSU_COMPAT_HAS_CONTEXT_ADD_HASH" "$KSU_DIR/tools/kernel_compat.mk" 2>/dev/null; then
+    echo "  ✅ Flag KSU_COMPAT_HAS_CONTEXT_ADD_HASH présent dans kernel_compat.mk"
+else
+    echo "  ❌ Flag absent de kernel_compat.mk"
 fi
 cd ..
 
 # ==================== 12. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SELinuxFix-v13-boot.img
+cp final_boot.img output/BakaSU-Final-v15-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v13 ==="
-echo "Mode : SUSFS Inline + Forçage Fix SELinux SIDTAB + init.rc injecté"
+echo "=== BUILD TERMINÉ v15 ==="
+echo "Mode : SUSFS Inline + Fix SELinux SIDTAB + init.rc + allow_shell"
 ls -lh output/
