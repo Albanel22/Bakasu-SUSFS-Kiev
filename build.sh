@@ -201,61 +201,62 @@ else
     echo "⚠️  app_profile.c introuvable"
 fi
 
-# ==================== 2g. FIX SECCOMP DANS ksu_handle_setuid (BACKSLASHXX) ====================
+# ==================== 2g. FIX SECCOMP DANS setuid_hook (BACKSLASHXX) ====================
 echo ""
-echo "=== Fix seccomp dans ksu_handle_setuid (méthode backslashxx) ==="
+echo "=== Fix seccomp dans setuid_hook (méthode backslashxx) ==="
 
-CORE_HOOK=$(find "$KSU_DIR" -name "core_hook.c" -o -name "app_profile.c" 2>/dev/null | head -1)
-if [ -n "$CORE_HOOK" ]; then
-    echo "Fichier trouvé : $CORE_HOOK"
-    if grep -q "ksu_handle_setuid" "$CORE_HOOK"; then
-        if ! grep -A 30 "ksu_handle_setuid" "$CORE_HOOK" | grep -q "disable_seccomp"; then
-            echo "⚠️  disable_seccomp() absent de ksu_handle_setuid, injection..."
-            python3 - "$CORE_HOOK" << 'PYEOF'
+SETUID_HOOK="$KSU_DIR/kernel/hook/setuid_hook.c"
+
+if [ -f "$SETUID_HOOK" ]; then
+    echo "Fichier trouvé : $SETUID_HOOK"
+    
+    # Vérifier si le fix backslashxx est déjà présent
+    if grep -q "ksu_seccomp_allow_cache.*__NR_reboot" "$SETUID_HOOK"; then
+        echo "✅ ksu_seccomp_allow_cache(__NR_reboot) déjà présent"
+    else
+        echo "⚠️  Remplacement de disable_seccomp() par ksu_seccomp_allow_cache(__NR_reboot)..."
+        python3 - "$SETUID_HOOK" << 'PYEOF'
 import sys, re
 path = sys.argv[1]
 with open(path, 'r') as f:
     content = f.read()
 
-pattern = r'(ksu_handle_setuid\s*\([^)]*\)\s*\{)'
-match = re.search(pattern, content)
-if match:
-    body_start = match.end()
-    lines = content[body_start:].split('\n')
-    insert_line = 0
-    for i, line in enumerate(lines):
-        if 'ksu_is_allow_uid' in line or 'is_allow_uid' in line:
-            for j in range(i+1, min(i+10, len(lines))):
-                if lines[j].strip().endswith('{'):
-                    insert_line = j + 1
-                    break
-            if insert_line > 0:
-                break
-    
-    if insert_line > 0:
-        reset_code = '''
-#ifdef CONFIG_SECCOMP
-		disable_seccomp();
-#endif
-'''
-        lines.insert(insert_line, reset_code)
-        content = content[:body_start] + '\n'.join(lines)
+# Chercher le bloc #else disable_seccomp(); dans ksu_handle_setuid
+old_block = '''#else
+        disable_seccomp();
+#endif'''
+new_block = '''#else
+        if (current->seccomp.mode == SECCOMP_MODE_FILTER && current->seccomp.filter) {
+            spin_lock_irq(&current->sighand->siglock);
+            ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
+            spin_unlock_irq(&current->sighand->siglock);
+        }
+#endif'''
+
+if old_block in content:
+    content = content.replace(old_block, new_block, 1)
+    with open(path, 'w') as f:
+        f.write(content)
+    print("✅ disable_seccomp() remplacé par ksu_seccomp_allow_cache(__NR_reboot) pour noyau < 5.10")
+else:
+    # Fallback: chercher juste disable_seccomp(); et le remplacer
+    if 'disable_seccomp();' in content:
+        print("⚠️  Bloc #else exact non trouvé, remplacement direct de disable_seccomp()...")
+        content = content.replace('disable_seccomp();', 
+            '''if (current->seccomp.mode == SECCOMP_MODE_FILTER && current->seccomp.filter) {
+            spin_lock_irq(&current->sighand->siglock);
+            ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
+            spin_unlock_irq(&current->sighand->siglock);
+        }''', 1)
         with open(path, 'w') as f:
             f.write(content)
-        print("✅ disable_seccomp() injecté dans ksu_handle_setuid (après vérification UID)")
+        print("✅ disable_seccomp() remplacé par ksu_seccomp_allow_cache(__NR_reboot)")
     else:
-        print("❌ Impossible de trouver le bloc de vérification UID dans ksu_handle_setuid")
-else:
-    print("❌ ksu_handle_setuid non trouvée dans le fichier")
+        print("❌ disable_seccomp() non trouvé dans le fichier")
 PYEOF
-        else
-            echo "✅ disable_seccomp() déjà présent dans ksu_handle_setuid"
-        fi
-    else
-        echo "⚠️  ksu_handle_setuid non trouvée dans $CORE_HOOK"
     fi
 else
-    echo "⚠️  core_hook.c / app_profile.c introuvable"
+    echo "⚠️  setuid_hook.c introuvable à $SETUID_HOOK"
 fi
 
 # ==================== 3. PATCH SUSFS (cyberc3dr) ====================
