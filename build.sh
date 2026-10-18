@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# V23 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
-#       + FIX O_CLOEXEC (Dynamique) + HOOK ksu_handle_sys_reboot (C89)
+# V24 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
+#       + FIX O_CLOEXEC (Boucle Globale) + HOOK ksu_handle_sys_reboot (C89)
 # =============================================================================
 
-echo "=== Build BakaSU (SUSFS + repack backslashxx + hook sys_reboot) v23 ==="
+echo "=== Build BakaSU (SUSFS + repack backslashxx + hook sys_reboot) v24 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -116,46 +116,34 @@ echo "=== Static exports SELinux ==="
     sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 }
 
-# ==================== 2e. FIX O_CLOEXEC (RECHERCHE DYNAMIQUE) ====================
+# ==================== 2e. FIX O_CLOEXEC (BOUCLE GLOBALE) ====================
 echo ""
-echo "=== Fix O_CLOEXEC dans ksu_install_fd (détection Manager) ==="
+echo "=== Fix O_CLOEXEC dans TOUS les fichiers (détection Manager) ==="
 
-# Cherche le fichier qui contient la fonction de création du fd
-SUPERCALLS_FILE=$(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null | head -1)
-
-if [ -n "$SUPERCALLS_FILE" ]; then
-    echo "Fichier trouvé : $SUPERCALLS_FILE"
-    sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$SUPERCALLS_FILE"
-    
-    # Fix pour anon_inode_getfile
-    python3 - "$SUPERCALLS_FILE" << 'PYEOF'
-import sys
-path = sys.argv[1]
-with open(path, 'r') as f:
-    content = f.read()
-old1 = 'O_RDWR | O_CLOEXEC'
-old2 = 'O_RDWR|O_CLOEXEC'
-if old1 in content:
-    content = content.replace(old1, 'O_RDWR')
-    print("  ✅ O_RDWR | O_CLOEXEC -> O_RDWR")
-elif old2 in content:
-    content = content.replace(old2, 'O_RDWR')
-    print("  ✅ O_RDWR|O_CLOEXEC -> O_RDWR")
-else:
-    print("  ⚠️  Pattern O_CLOEXEC non trouvé dans anon_inode_getfile")
-with open(path, 'w') as f:
-    f.write(content)
-PYEOF
-    echo "✅ O_CLOEXEC retiré de $SUPERCALLS_FILE"
-else
-    echo "⚠️  Impossible de trouver le fichier contenant get_unused_fd_flags(O_CLOEXEC)."
-    echo "    Tentative de fallback sur les chemins connus..."
-    for candidate in "$KSU_DIR/kernel/supercall/supercall.c" "$KSU_DIR/kernel/supercalls.c" "$KSU_DIR/supercall/supercall.c"; do
-        if [ -f "$candidate" ]; then
-            sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$candidate"
-            echo "    ✅ Fallback appliqué sur $candidate"
-        fi
+# 1. Remplacer get_unused_fd_flags(O_CLOEXEC) par get_unused_fd_flags(0)
+FILES_GET_UNUSED=$(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null || true)
+if [ -n "$FILES_GET_UNUSED" ]; then
+    for f in $FILES_GET_UNUSED; do
+        sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
+        echo "  ✅ get_unused_fd_flags fixé dans $f"
     done
+else
+    echo "  ⚠️  Aucun get_unused_fd_flags(O_CLOEXEC) trouvé."
+fi
+
+# 2. Retirer O_CLOEXEC de anon_inode_getfile
+FILES_ANON_INODE=$(grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null || true)
+if [ -n "$FILES_ANON_INODE" ]; then
+    for f in $FILES_ANON_INODE; do
+        # Remplace O_RDWR | O_CLOEXEC par O_RDWR
+        sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g' "$f"
+        sed -i 's/O_RDWR|O_CLOEXEC/O_RDWR/g' "$f"
+        # Au cas où c'est juste O_CLOEXEC tout seul (ex: , O_CLOEXEC)) on le retire
+        sed -i 's/, O_CLOEXEC)/)/g' "$f"
+        echo "  ✅ anon_inode_getfile nettoyé dans $f"
+    done
+else
+    echo "  ⚠️  Aucun anon_inode_getfile trouvé."
 fi
 
 # ==================== 3. PATCH SUSFS (cyberc3dr) ====================
@@ -466,10 +454,10 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFS-v23-boot.img
+cp final_boot.img output/BakaSU-SUSFS-v24-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v23 ==="
+echo "=== BUILD TERMINÉ v24 ==="
 ls -lh output/
