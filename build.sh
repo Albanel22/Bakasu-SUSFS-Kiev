@@ -2,12 +2,13 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-MANUAL-HOOK-V20 : Manual Hook + sys_read (pour init.rc) + SUSFS
+# BRANCHE TEST-SUSFS-V21 : SUSFS (sync-susfs + patch cyberc3dr)
 # Source : Baka-SU/BakaSU (sync-susfs)
-# Approche : Le noyau injecte KERNEL_SU_RC lui-même via ksu_handle_sys_read.
+# Approche : Le noyau injecte KERNEL_SU_RC via ksu_handle_sys_read (SUSFS path).
+#            Pas de manual hook : on reste 100% dans le chemin SUSFS.
 # =============================================================================
 
-echo "=== Build BakaSU (Manual Hook) v20 ==="
+echo "=== Build BakaSU (SUSFS) v21 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -100,6 +101,7 @@ for h in "$KSU_DIR/infra/symbol_resolver.h" "$KSU_DIR/kernel/infra/symbol_resolv
 done
 
 # ==================== 2d. STATIC EXPORTS SELINUX ====================
+# Nécessaires pour la feature selinux_hide de BakaSU (cf. PR #623)
 echo "=== Static exports SELinux ==="
 [ -f "security/selinux/selinuxfs.c" ] && {
     sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
@@ -180,9 +182,9 @@ PYEOF
 fi
 echo "✅ Corrections SUSFS terminées"
 
-# ==================== 4. HOOK CRITIQUE POUR LANCER KSUD ====================
+# ==================== 4. HOOK CRITIQUE POUR LANCER KSUD (SUSFS) ====================
 echo ""
-echo "=== Injection du hook ksu_handle_sys_read (critique pour init.rc) ==="
+echo "=== Injection du hook ksu_handle_sys_read (SUSFS) ==="
 
 if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
   cat > /tmp/h_sys_read.py << 'PYEOF'
@@ -190,8 +192,7 @@ import re
 with open('fs/read_write.c', 'r') as f: content = f.read()
 if 'ksu_handle_sys_read' not in content:
     extern_decl = '''
-#ifdef CONFIG_KSU_MANUAL_HOOK
-extern struct static_key_true ksu_is_init_rc_hook_enabled;
+#ifdef CONFIG_KSU_SUSFS
 extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
 #endif
 '''
@@ -202,26 +203,25 @@ extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *c
 {'''
     new_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
 {
-#ifdef CONFIG_KSU_MANUAL_HOOK
-	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
-		ksu_handle_sys_read(fd, &buf, &count);
+#ifdef CONFIG_KSU_SUSFS
+	ksu_handle_sys_read(fd, &buf, &count);
 #endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: ksu_handle_sys_read (critique pour init.rc)")
+        print("OK: ksu_handle_sys_read injecté (SUSFS)")
 with open('fs/read_write.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h_sys_read.py
 else
-  echo "[i] Hook sys_read déjà présent"
+  echo "[i] Hook sys_read déjà présent (patch cyberc3dr probablement)"
 fi
 
-# NOTE : On n'injecte PAS les autres hooks manuels (execveat, faccessat, etc.).
-# Le patch SUSFS de cyberc3dr s'occupe déjà de la partie susfs côté noyau.
+# NOTE : pas d'injection execveat / faccessat / fstat.
+# Le patch SUSFS de cyberc3dr et les fonctionnalités BakaSU s'occupent du reste.
 
-# ==================== 5. CONFIGURATION ====================
+# ==================== 5. CONFIGURATION (SUSFS) ====================
 echo ""
-echo "=== Configuration (MANUAL_HOOK pour lancer ksud) ==="
+echo "=== Configuration (SUSFS pur) ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -230,12 +230,9 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 {
   echo "CONFIG_KSU=y"
-  echo "CONFIG_KSU_MANUAL_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y"
-  echo "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"
+  echo "CONFIG_KSU_SUSFS=y"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
-  echo "# CONFIG_KSU_SUSFS is not set"
+  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
   echo "CONFIG_KPROBES=y"
   echo "CONFIG_HAVE_KPROBES=y"
   echo "CONFIG_KRETPROBES=y"
@@ -245,16 +242,14 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
-# Forçage post-olddefconfig
-sed -i 's/^# CONFIG_KSU_MANUAL_HOOK is not set/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
-sed -i 's/^CONFIG_KSU_SUSFS=y/# CONFIG_KSU_SUSFS is not set/' out/.config
-if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
-    echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
-fi
-make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -3
-
 echo "=== État final .config ==="
-grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KPROBES" out/.config | head -20 || true
+grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KSU_TRACEPOINT|KPROBES" out/.config | head -20 || true
+
+# Sanity check : SUSFS doit être actif
+if ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
+    echo "❌ CONFIG_KSU_SUSFS non activé, abandon"
+    exit 1
+fi
 
 # ==================== 6. PATCHS MOTOROLA ====================
 echo "=== Patch signatures + tactile ==="
@@ -357,7 +352,7 @@ with open('header', 'r+b') as f:
 PYEOF
 fi
 
-# Ajout de ksud dans /system/bin/ du ramdisk (le noyau s'occupe de l'init.rc)
+# Ajout de ksud dans /system/bin/ du ramdisk (le noyau s'occupe de l'init.rc via sys_read)
 rm -rf ramdisk_work
 mkdir -p ramdisk_work
 cd ramdisk_work
@@ -404,10 +399,10 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-ManualHook-v20-boot.img
+cp final_boot.img output/BakaSU-SUSFS-v21-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v20 ==="
+echo "=== BUILD TERMINÉ v21 (SUSFS) ==="
 ls -lh output/
