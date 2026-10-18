@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # V23 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
-#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (DÉTECTION MANAGER)
+#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89 compliant)
 # =============================================================================
 
 echo "=== Build BakaSU (SUSFS + repack backslashxx + hook sys_reboot) v23 ==="
@@ -137,7 +137,6 @@ import sys
 path = sys.argv[1]
 with open(path, 'r') as f:
     content = f.read()
-# Remplace O_RDWR | O_CLOEXEC par O_RDWR (avec ou sans espaces)
 old1 = 'O_RDWR | O_CLOEXEC'
 old2 = 'O_RDWR|O_CLOEXEC'
 if old1 in content:
@@ -219,8 +218,7 @@ PYEOF
 fi
 echo "✅ Corrections SUSFS terminées"
 
-# ==================== 4. HOOK CRITIQUE : ksu_handle_sys_reboot ====================
-# C'EST CE HOOK QUI PERMET AU MANAGER DE DÉTECTER LE NOYAU.
+# ==================== 4. HOOK CRITIQUE : ksu_handle_sys_reboot (C89) ====================
 echo ""
 echo "=== Injection du hook ksu_handle_sys_reboot (DÉTECTION MANAGER) ==="
 
@@ -231,33 +229,38 @@ with open('kernel/reboot.c', 'r') as f:
     content = f.read()
 
 if 'ksu_handle_sys_reboot' not in content:
-    # Chercher la fonction SYSCALL_DEFINE4(reboot, ...)
-    # Elle peut être sur plusieurs lignes
-    pattern = r'(SYSCALL_DEFINE4\(reboot,\s*int,\s*magic1,\s*int,\s*magic2,\s*unsigned int,\s*cmd,\s*void __user \*,\s*arg\)\s*\{)'
-    match = re.search(pattern, content)
+    # 1. Ajouter l'extern avant la fonction
+    pattern_syscall = r'(SYSCALL_DEFINE4\(reboot,\s*int,\s*magic1,\s*int,\s*magic2,\s*unsigned int,\s*cmd,\s*void __user \*,\s*arg\)\s*\{)'
+    match = re.search(pattern_syscall, content)
+    
     if match:
-        # Ajouter l'extern avant la fonction
         extern = '''
 #if defined(CONFIG_KSU)
 extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);
 #endif
 '''
-        # Ajouter l'appel juste après le {
-        call = '''
+        content = content[:match.start()] + extern + content[match.start():]
+        
+        # 2. Chercher "int ret = 0;" DANS cette fonction pour injecter APRÈS les déclarations
+        start_pos = content.find('SYSCALL_DEFINE4(reboot')
+        if start_pos != -1:
+            ret_pos = content.find('int ret = 0;', start_pos)
+            if ret_pos != -1:
+                call = '''
 #if defined(CONFIG_KSU)
 	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
 #endif'''
-        # Insérer l'extern avant SYSCALL_DEFINE4
-        content = content[:match.start()] + extern + content[match.start():]
-        # Re-chercher après l'insertion
-        match = re.search(pattern, content)
-        if match:
-            content = content[:match.end()] + call + content[match.end():]
-            with open('kernel/reboot.c', 'w') as f:
-                f.write(content)
-            print("✅ Hook ksu_handle_sys_reboot inséré dans SYSCALL_DEFINE4(reboot)")
+                # Injecter après le point-virgule de "int ret = 0;"
+                insert_pos = ret_pos + len('int ret = 0;')
+                content = content[:insert_pos] + call + content[insert_pos:]
+                
+                with open('kernel/reboot.c', 'w') as f:
+                    f.write(content)
+                print("✅ Hook ksu_handle_sys_reboot inséré APRÈS les déclarations (C89 compliant)")
+            else:
+                print("❌ Impossible de trouver 'int ret = 0;' dans la fonction reboot")
         else:
-            print("❌ Impossible de trouver SYSCALL_DEFINE4(reboot) après insertion extern")
+            print("❌ Impossible de trouver la fonction reboot après insertion")
     else:
         print("❌ Pattern SYSCALL_DEFINE4(reboot) non trouvé")
 else:
