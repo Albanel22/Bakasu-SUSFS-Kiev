@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # V23 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
-#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89 compliant)
+#       + FIX O_CLOEXEC (Dynamique) + HOOK ksu_handle_sys_reboot (C89)
 # =============================================================================
 
 echo "=== Build BakaSU (SUSFS + repack backslashxx + hook sys_reboot) v23 ==="
@@ -116,23 +116,19 @@ echo "=== Static exports SELinux ==="
     sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 }
 
-# ==================== 2e. FIX O_CLOEXEC POUR LA DÉTECTION DU MANAGER ====================
+# ==================== 2e. FIX O_CLOEXEC (RECHERCHE DYNAMIQUE) ====================
 echo ""
 echo "=== Fix O_CLOEXEC dans ksu_install_fd (détection Manager) ==="
 
-SUPERCALLS=""
-for candidate in "$KSU_DIR/kernel/supercalls.c" "$KSU_DIR/supercalls.c" "kernel/supercalls.c"; do
-    if [ -f "$candidate" ]; then
-        SUPERCALLS="$candidate"
-        break
-    fi
-done
+# Cherche le fichier qui contient la fonction de création du fd
+SUPERCALLS_FILE=$(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null | head -1)
 
-if [ -n "$SUPERCALLS" ]; then
-    echo "Fichier trouvé : $SUPERCALLS"
-    sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$SUPERCALLS"
-    # Fix plus permissif pour anon_inode_getfile
-    python3 - "$SUPERCALLS" << 'PYEOF'
+if [ -n "$SUPERCALLS_FILE" ]; then
+    echo "Fichier trouvé : $SUPERCALLS_FILE"
+    sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$SUPERCALLS_FILE"
+    
+    # Fix pour anon_inode_getfile
+    python3 - "$SUPERCALLS_FILE" << 'PYEOF'
 import sys
 path = sys.argv[1]
 with open(path, 'r') as f:
@@ -146,13 +142,20 @@ elif old2 in content:
     content = content.replace(old2, 'O_RDWR')
     print("  ✅ O_RDWR|O_CLOEXEC -> O_RDWR")
 else:
-    print("  ⚠️  Pattern O_CLOEXEC non trouvé (peut-être déjà absent)")
+    print("  ⚠️  Pattern O_CLOEXEC non trouvé dans anon_inode_getfile")
 with open(path, 'w') as f:
     f.write(content)
 PYEOF
-    echo "✅ O_CLOEXEC retiré de $SUPERCALLS"
+    echo "✅ O_CLOEXEC retiré de $SUPERCALLS_FILE"
 else
-    echo "⚠️  supercalls.c introuvable dans $KSU_DIR"
+    echo "⚠️  Impossible de trouver le fichier contenant get_unused_fd_flags(O_CLOEXEC)."
+    echo "    Tentative de fallback sur les chemins connus..."
+    for candidate in "$KSU_DIR/kernel/supercall/supercall.c" "$KSU_DIR/kernel/supercalls.c" "$KSU_DIR/supercall/supercall.c"; do
+        if [ -f "$candidate" ]; then
+            sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$candidate"
+            echo "    ✅ Fallback appliqué sur $candidate"
+        fi
+    done
 fi
 
 # ==================== 3. PATCH SUSFS (cyberc3dr) ====================
@@ -229,7 +232,6 @@ with open('kernel/reboot.c', 'r') as f:
     content = f.read()
 
 if 'ksu_handle_sys_reboot' not in content:
-    # 1. Ajouter l'extern avant la fonction
     pattern_syscall = r'(SYSCALL_DEFINE4\(reboot,\s*int,\s*magic1,\s*int,\s*magic2,\s*unsigned int,\s*cmd,\s*void __user \*,\s*arg\)\s*\{)'
     match = re.search(pattern_syscall, content)
     
@@ -241,7 +243,6 @@ extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);
 '''
         content = content[:match.start()] + extern + content[match.start():]
         
-        # 2. Chercher "int ret = 0;" DANS cette fonction pour injecter APRÈS les déclarations
         start_pos = content.find('SYSCALL_DEFINE4(reboot')
         if start_pos != -1:
             ret_pos = content.find('int ret = 0;', start_pos)
@@ -250,7 +251,6 @@ extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);
 #if defined(CONFIG_KSU)
 	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
 #endif'''
-                # Injecter après le point-virgule de "int ret = 0;"
                 insert_pos = ret_pos + len('int ret = 0;')
                 content = content[:insert_pos] + call + content[insert_pos:]
                 
@@ -323,7 +323,6 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 {
   echo "CONFIG_KSU=y"
   echo "CONFIG_KSU_SUSFS=y"
-  # TAMPER désactivé : le hook sys_reboot est manuel, pas besoin de tamper
   echo "# CONFIG_KSU_TAMPER_SYSCALL_TABLE is not set"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
   echo "# CONFIG_KSU_MANUAL_HOOK is not set"
