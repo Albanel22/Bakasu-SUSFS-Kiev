@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # =============================================================================
-# V24 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
-#       + FIX O_CLOEXEC (Boucle Globale) + HOOK ksu_handle_sys_reboot (C89)
+# V25 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
+#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89)
+#       + VÉRIFICATION disable_seccomp + CONFIG_SECCOMP
 # =============================================================================
 
-echo "=== Build BakaSU (SUSFS + repack backslashxx + hook sys_reboot) v24 ==="
+echo "=== Build BakaSU (SUSFS + repack backslashxx + seccomp fix) v25 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -120,7 +121,6 @@ echo "=== Static exports SELinux ==="
 echo ""
 echo "=== Fix O_CLOEXEC dans TOUS les fichiers (détection Manager) ==="
 
-# 1. Remplacer get_unused_fd_flags(O_CLOEXEC) par get_unused_fd_flags(0)
 FILES_GET_UNUSED=$(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null || true)
 if [ -n "$FILES_GET_UNUSED" ]; then
     for f in $FILES_GET_UNUSED; do
@@ -131,19 +131,75 @@ else
     echo "  ⚠️  Aucun get_unused_fd_flags(O_CLOEXEC) trouvé."
 fi
 
-# 2. Retirer O_CLOEXEC de anon_inode_getfile
 FILES_ANON_INODE=$(grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null || true)
 if [ -n "$FILES_ANON_INODE" ]; then
     for f in $FILES_ANON_INODE; do
-        # Remplace O_RDWR | O_CLOEXEC par O_RDWR
         sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g' "$f"
         sed -i 's/O_RDWR|O_CLOEXEC/O_RDWR/g' "$f"
-        # Au cas où c'est juste O_CLOEXEC tout seul (ex: , O_CLOEXEC)) on le retire
         sed -i 's/, O_CLOEXEC)/)/g' "$f"
         echo "  ✅ anon_inode_getfile nettoyé dans $f"
     done
 else
     echo "  ⚠️  Aucun anon_inode_getfile trouvé."
+fi
+
+# ==================== 2f. VÉRIFICATION disable_seccomp (NON-GKI) ====================
+echo ""
+echo "=== Vérification disable_seccomp pour noyau 4.19 ==="
+
+APP_PROFILE=$(find "$KSU_DIR" -name "app_profile.c" 2>/dev/null | head -1)
+if [ -n "$APP_PROFILE" ]; then
+    echo "Fichier trouvé : $APP_PROFILE"
+    
+    # 1. Vérifier que disable_seccomp est appelée dans escape_with_root_profile
+    if grep -q "escape_with_root_profile" "$APP_PROFILE"; then
+        if ! grep -A 20 "void escape_with_root_profile" "$APP_PROFILE" | grep -q "disable_seccomp"; then
+            echo "⚠️  disable_seccomp() non appelée dans escape_with_root_profile, injection..."
+            python3 - "$APP_PROFILE" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+pattern = r'(void\s+escape_with_root_profile\s*\([^)]*\)\s*\{)'
+match = re.search(pattern, content)
+if match:
+    body_start = match.end()
+    lines = content[body_start:].split('\n')
+    insert_line = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith('struct') and not stripped.startswith('int ') and not stripped.startswith('return'):
+            insert_line = i
+            break
+    
+    reset_code = '\n\tdisable_seccomp();\n'
+    if insert_line > 0:
+        lines.insert(insert_line, reset_code)
+    else:
+        lines.insert(0, reset_code)
+    
+    content = content[:body_start] + '\n'.join(lines)
+    with open(path, 'w') as f:
+        f.write(content)
+    print("✅ disable_seccomp() injectée dans escape_with_root_profile")
+else:
+    print("❌ escape_with_root_profile non trouvée")
+PYEOF
+        else
+            echo "✅ disable_seccomp() déjà appelée dans escape_with_root_profile"
+        fi
+    else
+        echo "⚠️  escape_with_root_profile non trouvée dans app_profile.c"
+    fi
+    
+    # 2. Vérifier que disable_seccomp est bien exportée (non-static)
+    if grep -q "^static void disable_seccomp" "$APP_PROFILE"; then
+        echo "⚠️  disable_seccomp est static, correction..."
+        sed -i 's/^static void disable_seccomp/void disable_seccomp/' "$APP_PROFILE"
+    fi
+else
+    echo "⚠️  app_profile.c introuvable"
 fi
 
 # ==================== 3. PATCH SUSFS (cyberc3dr) ====================
@@ -299,9 +355,9 @@ else
   echo "[i] Hook sys_read déjà présent"
 fi
 
-# ==================== 5. CONFIGURATION (SUSFS) ====================
+# ==================== 5. CONFIGURATION (SUSFS + SECCOMP) ====================
 echo ""
-echo "=== Configuration (SUSFS pur) ==="
+echo "=== Configuration (SUSFS pur + SECCOMP) ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -317,6 +373,8 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_KPROBES=y"
   echo "CONFIG_HAVE_KPROBES=y"
   echo "CONFIG_KRETPROBES=y"
+  echo "CONFIG_SECCOMP=y"
+  echo "CONFIG_SECCOMP_FILTER=y"
   echo "CONFIG_COMPAT=y"
   echo "CONFIG_COMPAT_32BIT_TIME=y"
 } >> out/.config
@@ -324,7 +382,7 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
 echo "=== État final .config ==="
-grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KSU_TRACEPOINT|KSU_TAMPER|KPROBES" out/.config | head -20 || true
+grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KSU_TRACEPOINT|KSU_TAMPER|KPROBES|SECCOMP" out/.config | head -20 || true
 
 if ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
     echo "❌ CONFIG_KSU_SUSFS non activé, abandon"
@@ -454,10 +512,10 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFS-v24-boot.img
+cp final_boot.img output/BakaSU-SUSFS-v25-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v24 ==="
+echo "=== BUILD TERMINÉ v25 ==="
 ls -lh output/
