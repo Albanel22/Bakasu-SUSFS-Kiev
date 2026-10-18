@@ -131,7 +131,26 @@ done
 if [ -n "$SUPERCALLS" ]; then
     echo "Fichier trouvé : $SUPERCALLS"
     sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$SUPERCALLS"
-    sed -i 's/anon_inode_getfile(\[ksu_driver\], \&anon_ksu_fops, NULL, O_RDWR | O_CLOEXEC)/anon_inode_getfile("[ksu_driver]", \&anon_ksu_fops, NULL, O_RDWR)/g' "$SUPERCALLS"
+    # Fix plus permissif pour anon_inode_getfile
+    python3 - "$SUPERCALLS" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+# Remplace O_RDWR | O_CLOEXEC par O_RDWR (avec ou sans espaces)
+old1 = 'O_RDWR | O_CLOEXEC'
+old2 = 'O_RDWR|O_CLOEXEC'
+if old1 in content:
+    content = content.replace(old1, 'O_RDWR')
+    print("  ✅ O_RDWR | O_CLOEXEC -> O_RDWR")
+elif old2 in content:
+    content = content.replace(old2, 'O_RDWR')
+    print("  ✅ O_RDWR|O_CLOEXEC -> O_RDWR")
+else:
+    print("  ⚠️  Pattern O_CLOEXEC non trouvé (peut-être déjà absent)")
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
     echo "✅ O_CLOEXEC retiré de $SUPERCALLS"
 else
     echo "⚠️  supercalls.c introuvable dans $KSU_DIR"
@@ -202,23 +221,48 @@ echo "✅ Corrections SUSFS terminées"
 
 # ==================== 4. HOOK CRITIQUE : ksu_handle_sys_reboot ====================
 # C'EST CE HOOK QUI PERMET AU MANAGER DE DÉTECTER LE NOYAU.
-# Sans lui, le Manager envoie reboot(KSU_MAGIC1, KSU_MAGIC2, CMD_GET_VERSION)
-# et le noyau l'ignore → "kernel not detected".
 echo ""
 echo "=== Injection du hook ksu_handle_sys_reboot (DÉTECTION MANAGER) ==="
 
 if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
-    sed -i '/SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,/i\
-#if defined(CONFIG_KSU)\
-extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);\
-#endif' kernel/reboot.c
+    python3 << 'PYEOF'
+import re
+with open('kernel/reboot.c', 'r') as f:
+    content = f.read()
 
-    sed -i '/int ret = 0;/a\
-#if defined(CONFIG_KSU)\
-\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\
-#endif' kernel/reboot.c
-
-    echo "✅ Hook ksu_handle_sys_reboot inséré dans kernel/reboot.c"
+if 'ksu_handle_sys_reboot' not in content:
+    # Chercher la fonction SYSCALL_DEFINE4(reboot, ...)
+    # Elle peut être sur plusieurs lignes
+    pattern = r'(SYSCALL_DEFINE4\(reboot,\s*int,\s*magic1,\s*int,\s*magic2,\s*unsigned int,\s*cmd,\s*void __user \*,\s*arg\)\s*\{)'
+    match = re.search(pattern, content)
+    if match:
+        # Ajouter l'extern avant la fonction
+        extern = '''
+#if defined(CONFIG_KSU)
+extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);
+#endif
+'''
+        # Ajouter l'appel juste après le {
+        call = '''
+#if defined(CONFIG_KSU)
+	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+#endif'''
+        # Insérer l'extern avant SYSCALL_DEFINE4
+        content = content[:match.start()] + extern + content[match.start():]
+        # Re-chercher après l'insertion
+        match = re.search(pattern, content)
+        if match:
+            content = content[:match.end()] + call + content[match.end():]
+            with open('kernel/reboot.c', 'w') as f:
+                f.write(content)
+            print("✅ Hook ksu_handle_sys_reboot inséré dans SYSCALL_DEFINE4(reboot)")
+        else:
+            print("❌ Impossible de trouver SYSCALL_DEFINE4(reboot) après insertion extern")
+    else:
+        print("❌ Pattern SYSCALL_DEFINE4(reboot) non trouvé")
+else:
+    print("✅ Hook déjà présent")
+PYEOF
 else
     echo "✅ Hook ksu_handle_sys_reboot déjà présent"
 fi
@@ -276,7 +320,8 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 {
   echo "CONFIG_KSU=y"
   echo "CONFIG_KSU_SUSFS=y"
-  echo "CONFIG_KSU_TAMPER_SYSCALL_TABLE=y"
+  # TAMPER désactivé : le hook sys_reboot est manuel, pas besoin de tamper
+  echo "# CONFIG_KSU_TAMPER_SYSCALL_TABLE is not set"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
   echo "# CONFIG_KSU_MANUAL_HOOK is not set"
   echo "CONFIG_KPROBES=y"
