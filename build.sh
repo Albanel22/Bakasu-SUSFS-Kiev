@@ -2,13 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SUSFS-V21 : SUSFS (sync-susfs + patch cyberc3dr)
-# Source : Baka-SU/BakaSU (sync-susfs)
-# Approche : Le noyau injecte KERNEL_SU_RC via ksu_handle_sys_read (SUSFS path).
-#            Pas de manual hook : on reste 100% dans le chemin SUSFS.
+# V22 : BakaSU sync-susfs + patch cyberc3dr + REPACK MÉTHODE BACKSLASHXX
+# Le noyau est identique au v21 (stable), seul le repack change.
 # =============================================================================
 
-echo "=== Build BakaSU (SUSFS) v21 ==="
+echo "=== Build BakaSU (SUSFS + repack backslashxx) v22 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -101,7 +99,6 @@ for h in "$KSU_DIR/infra/symbol_resolver.h" "$KSU_DIR/kernel/infra/symbol_resolv
 done
 
 # ==================== 2d. STATIC EXPORTS SELINUX ====================
-# Nécessaires pour la feature selinux_hide de BakaSU (cf. PR #623)
 echo "=== Static exports SELinux ==="
 [ -f "security/selinux/selinuxfs.c" ] && {
     sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
@@ -216,9 +213,6 @@ else
   echo "[i] Hook sys_read déjà présent (patch cyberc3dr probablement)"
 fi
 
-# NOTE : pas d'injection execveat / faccessat / fstat.
-# Le patch SUSFS de cyberc3dr et les fonctionnalités BakaSU s'occupent du reste.
-
 # ==================== 5. CONFIGURATION (SUSFS) ====================
 echo ""
 echo "=== Configuration (SUSFS pur) ==="
@@ -245,7 +239,6 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 echo "=== État final .config ==="
 grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KSU_TRACEPOINT|KPROBES" out/.config | head -20 || true
 
-# Sanity check : SUSFS doit être actif
 if ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
     echo "❌ CONFIG_KSU_SUSFS non activé, abandon"
     exit 1
@@ -270,9 +263,9 @@ else
     exit 1
 fi
 
-# ==================== 8. COMPILATION KSUD ====================
+# ==================== 8. COMPILATION KSUD (BakaSU sync-susfs) ====================
 echo ""
-echo "=== Compilation ksud (sync-susfs) ==="
+echo "=== Compilation ksud (BakaSU sync-susfs) ==="
 cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -304,9 +297,9 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé (sync-susfs)"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 9. REPACK (SANS INJECTION MANUELLE DE INIT.RC) ====================
+# ==================== 9. REPACK (MÉTHODE BACKSLASHXX) ====================
 echo ""
-echo "=== Repack (injection init.rc gérée par le noyau) ==="
+echo "=== Repack (méthode backslashxx : magiskboot cpio add) ==="
 
 rm -f boot-stock.img
 if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
@@ -320,55 +313,35 @@ gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 
 
 mkdir -p repack
 cp boot-stock.img repack/boot.img
-cp "$GITHUB_WORKSPACE/ksud" repack/ksud
 wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O Magisk-v27.0.apk
 unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so
 mv lib/x86_64/libmagiskboot.so repack/magiskboot
 chmod +x repack/magiskboot
 rm -rf Magisk-v27.0.apk lib/
-cd repack
 
+cd repack
+set +e
 ./magiskboot unpack boot.img
-if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then
-    echo "❌ Échec unpack"; exit 1
-fi
+set -e
 
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-# Ajout allow_shell dans le header
-if [ -f "header" ]; then
-    echo "→ Ajout de allow_shell=1 à la cmdline dans le header"
-    python3 - << 'PYEOF'
-with open('header', 'r+b') as f:
-    header = f.read()
-    cmdline_offset = 44
-    cmdline = header[cmdline_offset:cmdline_offset+512].split(b'\x00')[0].decode('utf-8', errors='ignore')
-    if 'allow_shell' not in cmdline:
-        new_cmdline = cmdline + ' kernelsu.allow_shell=1 allow_shell=1'
-        new_bytes = new_cmdline.encode('utf-8')
-        f.seek(cmdline_offset)
-        f.write(new_bytes + b'\x00' * (512 - len(new_bytes)))
-        print("  ✅ Cmdline patchée dans header")
-PYEOF
-fi
+# Injection EXACTEMENT comme backslashxx (préserve les xattrs SELinux)
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 data" \
+    "mkdir 0755 data/adb" \
+    "mkdir 0755 data/adb/ksud" \
+    "add 0755 data/adb/ksud/ksud $GITHUB_WORKSPACE/ksud"
 
-# Ajout de ksud dans /system/bin/ du ramdisk (le noyau s'occupe de l'init.rc via sys_read)
-rm -rf ramdisk_work
-mkdir -p ramdisk_work
-cd ramdisk_work
-cpio -idm < ../ramdisk.cpio 2>/dev/null || true
-mkdir -p system/bin
-cp ../ksud system/bin/ksud
-chmod 755 system/bin/ksud
-echo "✅ ksud ajouté à system/bin"
-find . | cpio -o -H newc 2>/dev/null | gzip -9 > ../ramdisk.cpio
-cd ..
+cp "$GITHUB_WORKSPACE/ksud" local_su_binary
+chmod 755 local_su_binary
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 system" \
+    "mkdir 0755 system/bin" \
+    "add 06755 system/bin/su ./local_su_binary"
+rm -f local_su_binary
 
-echo "→ Repack du boot.img..."
 ./magiskboot repack boot.img new-boot.img
-if [ ! -f "new-boot.img" ]; then
-    echo "❌ Échec repack"; exit 1
-fi
 mv new-boot.img ../final_boot.img
 cd ..
 
@@ -385,24 +358,25 @@ if [ -f "kernel" ]; then
 fi
 
 if [ -f "ramdisk.cpio" ]; then
-    mkdir -p ramdisk_check
-    cd ramdisk_check
-    cpio -idm < ../ramdisk.cpio 2>/dev/null || true
-    if [ -f "system/bin/ksud" ]; then
-        echo "  ✅ ksud présent dans system/bin/"
+    if ../repack/magiskboot cpio ramdisk.cpio "exists data/adb/ksud/ksud" 2>/dev/null; then
+        echo "  ✅ ksud présent dans /data/adb/ksud/"
     else
         echo "  ❌ ksud absent"
     fi
-    cd ..
+    if ../repack/magiskboot cpio ramdisk.cpio "exists system/bin/su" 2>/dev/null; then
+        echo "  ✅ su présent dans /system/bin/"
+    else
+        echo "  ❌ su absent"
+    fi
 fi
 cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFS-v21-boot.img
+cp final_boot.img output/BakaSU-SUSFS-v22-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v21 (SUSFS) ==="
+echo "=== BUILD TERMINÉ v22 ==="
 ls -lh output/
