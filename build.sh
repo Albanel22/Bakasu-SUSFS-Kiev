@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# V22 : BakaSU sync-susfs + patch cyberc3dr + REPACK MÉTHODE BACKSLASHXX
-# Le noyau est identique au v21 (stable), seul le repack change.
+# V23 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
+#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (DÉTECTION MANAGER)
 # =============================================================================
 
-echo "=== Build BakaSU (SUSFS + repack backslashxx) v22 ==="
+echo "=== Build BakaSU (SUSFS + repack backslashxx + hook sys_reboot) v23 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -116,6 +116,27 @@ echo "=== Static exports SELinux ==="
     sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 }
 
+# ==================== 2e. FIX O_CLOEXEC POUR LA DÉTECTION DU MANAGER ====================
+echo ""
+echo "=== Fix O_CLOEXEC dans ksu_install_fd (détection Manager) ==="
+
+SUPERCALLS=""
+for candidate in "$KSU_DIR/kernel/supercalls.c" "$KSU_DIR/supercalls.c" "kernel/supercalls.c"; do
+    if [ -f "$candidate" ]; then
+        SUPERCALLS="$candidate"
+        break
+    fi
+done
+
+if [ -n "$SUPERCALLS" ]; then
+    echo "Fichier trouvé : $SUPERCALLS"
+    sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$SUPERCALLS"
+    sed -i 's/anon_inode_getfile(\[ksu_driver\], \&anon_ksu_fops, NULL, O_RDWR | O_CLOEXEC)/anon_inode_getfile("[ksu_driver]", \&anon_ksu_fops, NULL, O_RDWR)/g' "$SUPERCALLS"
+    echo "✅ O_CLOEXEC retiré de $SUPERCALLS"
+else
+    echo "⚠️  supercalls.c introuvable dans $KSU_DIR"
+fi
+
 # ==================== 3. PATCH SUSFS (cyberc3dr) ====================
 echo ""
 echo "=== Patch SUSFS 4.19 (cyberc3dr) ==="
@@ -179,7 +200,37 @@ PYEOF
 fi
 echo "✅ Corrections SUSFS terminées"
 
-# ==================== 4. HOOK CRITIQUE POUR LANCER KSUD (SUSFS) ====================
+# ==================== 4. HOOK CRITIQUE : ksu_handle_sys_reboot ====================
+# C'EST CE HOOK QUI PERMET AU MANAGER DE DÉTECTER LE NOYAU.
+# Sans lui, le Manager envoie reboot(KSU_MAGIC1, KSU_MAGIC2, CMD_GET_VERSION)
+# et le noyau l'ignore → "kernel not detected".
+echo ""
+echo "=== Injection du hook ksu_handle_sys_reboot (DÉTECTION MANAGER) ==="
+
+if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+    sed -i '/SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,/i\
+#if defined(CONFIG_KSU)\
+extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);\
+#endif' kernel/reboot.c
+
+    sed -i '/int ret = 0;/a\
+#if defined(CONFIG_KSU)\
+\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\
+#endif' kernel/reboot.c
+
+    echo "✅ Hook ksu_handle_sys_reboot inséré dans kernel/reboot.c"
+else
+    echo "✅ Hook ksu_handle_sys_reboot déjà présent"
+fi
+
+if grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+    echo "✅ Vérifié : ksu_handle_sys_reboot présent dans kernel/reboot.c"
+else
+    echo "❌ ÉCHEC : ksu_handle_sys_reboot absent de kernel/reboot.c"
+    exit 1
+fi
+
+# ==================== 4b. HOOK CRITIQUE : ksu_handle_sys_read (init.rc) ====================
 echo ""
 echo "=== Injection du hook ksu_handle_sys_read (SUSFS) ==="
 
@@ -210,7 +261,7 @@ with open('fs/read_write.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h_sys_read.py
 else
-  echo "[i] Hook sys_read déjà présent (patch cyberc3dr probablement)"
+  echo "[i] Hook sys_read déjà présent"
 fi
 
 # ==================== 5. CONFIGURATION (SUSFS) ====================
@@ -225,6 +276,7 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 {
   echo "CONFIG_KSU=y"
   echo "CONFIG_KSU_SUSFS=y"
+  echo "CONFIG_KSU_TAMPER_SYSCALL_TABLE=y"
   echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
   echo "# CONFIG_KSU_MANUAL_HOOK is not set"
   echo "CONFIG_KPROBES=y"
@@ -237,7 +289,7 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
 echo "=== État final .config ==="
-grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KSU_TRACEPOINT|KPROBES" out/.config | head -20 || true
+grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KSU_TRACEPOINT|KSU_TAMPER|KPROBES" out/.config | head -20 || true
 
 if ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
     echo "❌ CONFIG_KSU_SUSFS non activé, abandon"
@@ -326,7 +378,6 @@ set -e
 
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
-# Injection EXACTEMENT comme backslashxx (préserve les xattrs SELinux)
 ./magiskboot cpio ramdisk.cpio \
     "mkdir 0755 data" \
     "mkdir 0755 data/adb" \
@@ -363,20 +414,15 @@ if [ -f "ramdisk.cpio" ]; then
     else
         echo "  ❌ ksud absent"
     fi
-    if ../repack/magiskboot cpio ramdisk.cpio "exists system/bin/su" 2>/dev/null; then
-        echo "  ✅ su présent dans /system/bin/"
-    else
-        echo "  ❌ su absent"
-    fi
 fi
 cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFS-v22-boot.img
+cp final_boot.img output/BakaSU-SUSFS-v23-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v22 ==="
+echo "=== BUILD TERMINÉ v23 ==="
 ls -lh output/
