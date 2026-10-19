@@ -2,20 +2,21 @@
 set -euo pipefail
 
 # =============================================================================
-# V28 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
-#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89)
-#       + FIX SECCOMP (ksu_seccomp_allow_cache)
-#       + FIX SIDTAB SYNC (commit upstream a810677)
+# V28.1 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
+#         + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89)
+#         + FIX SECCOMP (ksu_seccomp_allow_cache)
+#         + FIX SIDTAB SYNC (commit upstream a810677)
+#         + RM SÉCURISÉS
 # =============================================================================
 
-echo "=== Build BakaSU (SUSFS + repack backslashxx + sidtab sync) v28 ==="
+echo "=== Build BakaSU (SUSFS + repack backslashxx + sidtab sync) v28.1 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
 
-sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-sudo apt-get clean || true
+sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
+sudo apt-get clean 2>/dev/null || true
 sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list 2>/dev/null || true
 sudo apt-get update
 sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf-dev libssl-dev \
@@ -32,7 +33,7 @@ git log --oneline -1
 
 # ==================== 2. INTÉGRATION BakaSU (sync-susfs) ====================
 echo "=== Intégration BakaSU (sync-susfs) ==="
-rm -rf drivers/kernelsu KernelSU susfs4ksu || true
+rm -rf drivers/kernelsu KernelSU susfs4ksu 2>/dev/null || true
 
 curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/sync-susfs/kernel/setup.sh" | bash -s sync-susfs
 
@@ -54,7 +55,7 @@ echo "KSU_DIR : $KSU_DIR"
 echo ""
 echo "=== Neutralisation check.mk ==="
 for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepoint_hook_check.mk kprobe_check.mk; do
-    FILES=$(find . -name "$pattern" -type f 2>/dev/null)
+    FILES=$(find . -name "$pattern" -type f 2>/dev/null || true)
     if [ -n "$FILES" ]; then
         for f in $FILES; do
             sed -i 's/\$(error/\$(warning/g' "$f"
@@ -148,7 +149,7 @@ fi
 echo ""
 echo "=== Vérification disable_seccomp pour noyau 4.19 ==="
 
-APP_PROFILE=$(find "$KSU_DIR" -name "app_profile.c" 2>/dev/null | head -1)
+APP_PROFILE=$(find "$KSU_DIR" -name "app_profile.c" 2>/dev/null | head -1 || true)
 if [ -n "$APP_PROFILE" ]; then
     echo "Fichier trouvé : $APP_PROFILE"
     
@@ -260,7 +261,7 @@ fi
 echo ""
 echo "=== Fix sidtab sync (commit upstream a810677) ==="
 
-SELINUX_C=$(find "$KSU_DIR" -name "selinux.c" -path "*selinux*" 2>/dev/null | head -1)
+SELINUX_C=$(find "$KSU_DIR" -name "selinux.c" -path "*selinux*" 2>/dev/null | head -1 || true)
 
 if [ -f "$SELINUX_C" ]; then
     echo "Fichier trouvé : $SELINUX_C"
@@ -277,7 +278,6 @@ with open(path, 'r') as f:
 
 count = 0
 
-# Pattern 1: my_write_context
 old_pattern = '''length = security_context_to_sid_with_policy(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL);
     if (length)
         goto out;'''
@@ -293,7 +293,6 @@ if old_pattern in content:
     content = content.replace(old_pattern, new_pattern, 1)
     count += 1
 
-# Pattern 2: my_write_access scon
 old_scon = '''length = security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), &ssid, SECSID_NULL, GFP_KERNEL);
     if (length)
         goto out;'''
@@ -309,7 +308,6 @@ if old_scon in content:
     content = content.replace(old_scon, new_scon, 1)
     count += 1
 
-# Pattern 3: my_write_access tcon
 old_tcon = '''length = security_context_to_sid_with_policy(backup_sepolicy, tcon, strlen(tcon), &tsid, SECSID_NULL, GFP_KERNEL);
     if (length)
         goto out;'''
@@ -325,7 +323,6 @@ if old_tcon in content:
     content = content.replace(old_tcon, new_tcon, 1)
     count += 1
 
-# Ajouter tmp dans les déclarations
 if 'u32 sid, len;' in content and 'u32 sid, len, tmp;' not in content:
     content = content.replace('u32 sid, len;', 'u32 sid, len, tmp;', 1)
 
@@ -348,11 +345,11 @@ fi
 echo ""
 echo "=== Patch SUSFS 4.19 (cyberc3dr) ==="
 cd "$GITHUB_WORKSPACE"
-rm -rf /tmp/cyber_repo
+rm -rf /tmp/cyber_repo 2>/dev/null || true
 git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Build.git /tmp/cyber_repo 2>/dev/null || true
 
 cd "$GITHUB_WORKSPACE/kernel_sources"
-PATCH_419=$(find /tmp/cyber_repo/Patches -name "*4.19*" -name "*.patch" 2>/dev/null | head -1)
+PATCH_419=$(find /tmp/cyber_repo/Patches -name "*4.19*" -name "*.patch" 2>/dev/null | head -1 || true)
 if [ -n "$PATCH_419" ]; then
     patch -p1 < "$PATCH_419" 2>&1 | tail -5 || true
 fi
@@ -563,7 +560,7 @@ export AARCH64_CLANG_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_
 export AARCH64_CLANGXX_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++"
 export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
-rm -rf "$GITHUB_WORKSPACE/ksud-src"
+rm -rf "$GITHUB_WORKSPACE/ksud-src" 2>/dev/null || true
 git clone --depth=1 --branch sync-susfs https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 mkdir -p .cargo
@@ -578,7 +575,7 @@ BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarc
 EOF
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 cargo +nightly build --release --target aarch64-linux-android
-KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1)
+KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1 || true)
 if [ -z "$KSUD_BINARY" ]; then echo "❌ ksud introuvable"; exit 1; fi
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé (sync-susfs)"
@@ -588,14 +585,14 @@ cd "$GITHUB_WORKSPACE"
 echo ""
 echo "=== Repack (méthode backslashxx : magiskboot cpio add) ==="
 
-rm -f boot-stock.img
+rm -f ./boot-stock.img 2>/dev/null || true
 if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
     echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"
 fi
 if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
     echo "❌ boot-stock.img invalide"; exit 1
 fi
-rm -f dtbo-stock.img
+rm -f ./dtbo-stock.img 2>/dev/null || true
 gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 || true
 
 mkdir -p repack
@@ -604,4 +601,60 @@ wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0
 unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so
 mv lib/x86_64/libmagiskboot.so repack/magiskboot
 chmod +x repack/magiskboot
-rm
+rm -rf ./Magisk-v27.0.apk ./lib 2>/dev/null || true
+
+cd repack
+set +e
+./magiskboot unpack boot.img
+set -e
+
+cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
+
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 data" \
+    "mkdir 0755 data/adb" \
+    "mkdir 0755 data/adb/ksud" \
+    "add 0755 data/adb/ksud/ksud $GITHUB_WORKSPACE/ksud"
+
+cp "$GITHUB_WORKSPACE/ksud" ./local_su_binary
+chmod 755 ./local_su_binary
+./magiskboot cpio ramdisk.cpio \
+    "mkdir 0755 system" \
+    "mkdir 0755 system/bin" \
+    "add 06755 system/bin/su ./local_su_binary"
+rm -f ./local_su_binary 2>/dev/null || true
+
+./magiskboot repack boot.img new-boot.img
+mv new-boot.img ../final_boot.img
+cd ..
+
+# ==================== 10. DIAGNOSTIC ====================
+echo ""
+echo "=== DIAGNOSTIC ==="
+mkdir -p verify; cd verify
+cp ../final_boot.img verify_boot.img
+../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
+if [ -f "kernel" ]; then
+    HASH_EXTRACTED=$(sha256sum kernel | cut -d' ' -f1)
+    HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
+    [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ] && echo "✅ Noyau IDENTIQUE"
+fi
+
+if [ -f "ramdisk.cpio" ]; then
+    if ../repack/magiskboot cpio ramdisk.cpio "exists data/adb/ksud/ksud" 2>/dev/null; then
+        echo "  ✅ ksud présent dans /data/adb/ksud/"
+    else
+        echo "  ❌ ksud absent"
+    fi
+fi
+cd ..
+
+# ==================== 11. SORTIE ====================
+mkdir -p output
+cp final_boot.img output/BakaSU-SUSFS-v28-boot.img
+cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
+cp kernel_sources/build.log output/
+cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
+echo ""
+echo "=== BUILD TERMINÉ v28 ==="
+ls -lh output/
