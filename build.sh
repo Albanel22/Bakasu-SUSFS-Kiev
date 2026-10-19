@@ -2,14 +2,13 @@
 set -euo pipefail
 
 # =============================================================================
-# V28.1 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
-#         + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89)
-#         + FIX SECCOMP (ksu_seccomp_allow_cache)
-#         + FIX SIDTAB SYNC (commit upstream a810677)
-#         + RM SÉCURISÉS
+# V29 : BakaSU main + patch cyberc3dr + REPACK BACKSLASHXX
+#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89)
+#       + FIX SECCOMP (ksu_seccomp_allow_cache)
+#       + FIX SIDTAB SYNC (commit upstream a810677)
 # =============================================================================
 
-echo "=== Build BakaSU (SUSFS + repack backslashxx + sidtab sync) v28.1 ==="
+echo "=== Build BakaSU (main + repack backslashxx + sidtab sync) v29 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -31,16 +30,16 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. INTÉGRATION BakaSU (sync-susfs) ====================
-echo "=== Intégration BakaSU (sync-susfs) ==="
+# ==================== 2. INTÉGRATION BakaSU (main) ====================
+echo "=== Intégration BakaSU (main) ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu 2>/dev/null || true
 
-curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/sync-susfs/kernel/setup.sh" | bash -s sync-susfs
+curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
 
 if [ ! -d "drivers/kernelsu" ] && [ ! -d "KernelSU/kernel" ]; then
     echo "❌ Échec intégration BakaSU"; exit 1
 fi
-echo "✅ BakaSU (sync-susfs) intégré"
+echo "✅ BakaSU (main) intégré"
 
 if [ -d "drivers/kernelsu" ]; then
     KSU_DIR="drivers/kernelsu"
@@ -547,9 +546,9 @@ else
     exit 1
 fi
 
-# ==================== 8. COMPILATION KSUD (BakaSU sync-susfs) ====================
+# ==================== 8. COMPILATION KSUD (BakaSU main) ====================
 echo ""
-echo "=== Compilation ksud (BakaSU sync-susfs) ==="
+echo "=== Compilation ksud (BakaSU main) ==="
 cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -561,7 +560,7 @@ export AARCH64_CLANGXX_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x8
 export AR_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
 rm -rf "$GITHUB_WORKSPACE/ksud-src" 2>/dev/null || true
-git clone --depth=1 --branch sync-susfs https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
+git clone --depth=1 --branch main https://github.com/Baka-SU/BakaSU.git "$GITHUB_WORKSPACE/ksud-src"
 cd "$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
@@ -578,7 +577,7 @@ cargo +nightly build --release --target aarch64-linux-android
 KSUD_BINARY=$(find "$GITHUB_WORKSPACE/ksud-src" -type f -name "ksud" -executable 2>/dev/null | head -1 || true)
 if [ -z "$KSUD_BINARY" ]; then echo "❌ ksud introuvable"; exit 1; fi
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé (sync-susfs)"
+echo "✅ ksud compilé (main)"
 cd "$GITHUB_WORKSPACE"
 
 # ==================== 9. REPACK (MÉTHODE BACKSLASHXX) ====================
@@ -651,10 +650,10 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFS-v28-boot.img
+cp final_boot.img output/BakaSU-SUSFS-v29-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v28 ==="
+echo "=== BUILD TERMINÉ v29 ==="
 ls -lh output/
