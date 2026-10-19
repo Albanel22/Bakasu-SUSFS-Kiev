@@ -2,10 +2,13 @@
 set -euo pipefail
 
 # =============================================================================
-# BRANCHE TEST-SYNC-SUSFS-V18 : Branche sync-susfs + Patch SUSFS + Hooks manuels
+# V28 : BakaSU sync-susfs + patch cyberc3dr + REPACK BACKSLASHXX
+#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89)
+#       + FIX SECCOMP (ksu_seccomp_allow_cache)
+#       + FIX SIDTAB SYNC (commit upstream a810677)
 # =============================================================================
 
-echo "=== Build BakaSU (sync-susfs) v18 ==="
+echo "=== Build BakaSU (SUSFS + repack backslashxx + sidtab sync) v28 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -27,7 +30,7 @@ git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lin
 cd kernel_sources
 git log --oneline -1
 
-# ==================== 2. INTÉGRATION BakaSU (BRANCHE SYNC-SUSFS) ====================
+# ==================== 2. INTÉGRATION BakaSU (sync-susfs) ====================
 echo "=== Intégration BakaSU (sync-susfs) ==="
 rm -rf drivers/kernelsu KernelSU susfs4ksu || true
 
@@ -47,9 +50,9 @@ else
 fi
 echo "KSU_DIR : $KSU_DIR"
 
-# ==================== 2e. NEUTRALISATION CHECK.MK ET KBUILD ====================
+# ==================== 2e. NEUTRALISATION CHECK.MK ====================
 echo ""
-echo "=== Neutralisation check.mk et Kbuild ==="
+echo "=== Neutralisation check.mk ==="
 for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepoint_hook_check.mk kprobe_check.mk; do
     FILES=$(find . -name "$pattern" -type f 2>/dev/null)
     if [ -n "$FILES" ]; then
@@ -58,13 +61,6 @@ for pattern in susfs_compat.mk inline_hook_check.mk manual_hook_check.mk tracepo
         done
     fi
 done
-
-# Neutraliser le Kbuild (pour l'erreur "You should integrate susfs")
-KSU_KBUILD="$KSU_DIR/Kbuild"
-if [ -f "$KSU_KBUILD" ]; then
-    sed -i 's/\$(error/\$(warning/g' "$KSU_KBUILD"
-    echo "✅ Kbuild neutralisé"
-fi
 
 # ==================== 2b. NETTOYAGE UNICODE ====================
 echo "=== Nettoyage Unicode ==="
@@ -122,20 +118,246 @@ echo "=== Static exports SELinux ==="
     sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 }
 
-# ==================== 3. PATCH SUSFS (OBLIGATOIRE POUR LE NOYAU) ====================
+# ==================== 2e. FIX O_CLOEXEC (BOUCLE GLOBALE) ====================
 echo ""
-echo "=== Patch SUSFS 4.19 (JackA1ltman) ==="
+echo "=== Fix O_CLOEXEC dans TOUS les fichiers (détection Manager) ==="
+
+FILES_GET_UNUSED=$(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null || true)
+if [ -n "$FILES_GET_UNUSED" ]; then
+    for f in $FILES_GET_UNUSED; do
+        sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
+        echo "  ✅ get_unused_fd_flags fixé dans $f"
+    done
+else
+    echo "  ⚠️  Aucun get_unused_fd_flags(O_CLOEXEC) trouvé."
+fi
+
+FILES_ANON_INODE=$(grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null || true)
+if [ -n "$FILES_ANON_INODE" ]; then
+    for f in $FILES_ANON_INODE; do
+        sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g' "$f"
+        sed -i 's/O_RDWR|O_CLOEXEC/O_RDWR/g' "$f"
+        sed -i 's/, O_CLOEXEC)/)/g' "$f"
+        echo "  ✅ anon_inode_getfile nettoyé dans $f"
+    done
+else
+    echo "  ⚠️  Aucun anon_inode_getfile trouvé."
+fi
+
+# ==================== 2f. VÉRIFICATION disable_seccomp (NON-GKI) ====================
+echo ""
+echo "=== Vérification disable_seccomp pour noyau 4.19 ==="
+
+APP_PROFILE=$(find "$KSU_DIR" -name "app_profile.c" 2>/dev/null | head -1)
+if [ -n "$APP_PROFILE" ]; then
+    echo "Fichier trouvé : $APP_PROFILE"
+    
+    if grep -q "escape_with_root_profile" "$APP_PROFILE"; then
+        if ! grep -A 20 "void escape_with_root_profile" "$APP_PROFILE" | grep -q "disable_seccomp"; then
+            echo "⚠️  disable_seccomp() non appelée dans escape_with_root_profile, injection..."
+            python3 - "$APP_PROFILE" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+pattern = r'(void\s+escape_with_root_profile\s*\([^)]*\)\s*\{)'
+match = re.search(pattern, content)
+if match:
+    body_start = match.end()
+    lines = content[body_start:].split('\n')
+    insert_line = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith('struct') and not stripped.startswith('int ') and not stripped.startswith('return'):
+            insert_line = i
+            break
+    
+    reset_code = '\n\tdisable_seccomp();\n'
+    if insert_line > 0:
+        lines.insert(insert_line, reset_code)
+    else:
+        lines.insert(0, reset_code)
+    
+    content = content[:body_start] + '\n'.join(lines)
+    with open(path, 'w') as f:
+        f.write(content)
+    print("✅ disable_seccomp() injectée dans escape_with_root_profile")
+else:
+    print("❌ escape_with_root_profile non trouvée")
+PYEOF
+        else
+            echo "✅ disable_seccomp() déjà appelée dans escape_with_root_profile"
+        fi
+    else
+        echo "⚠️  escape_with_root_profile non trouvée dans app_profile.c"
+    fi
+    
+    if grep -q "^static void disable_seccomp" "$APP_PROFILE"; then
+        echo "⚠️  disable_seccomp est static, correction..."
+        sed -i 's/^static void disable_seccomp/void disable_seccomp/' "$APP_PROFILE"
+    fi
+else
+    echo "⚠️  app_profile.c introuvable"
+fi
+
+# ==================== 2g. FIX SECCOMP DANS setuid_hook (BACKSLASHXX) ====================
+echo ""
+echo "=== Fix seccomp dans setuid_hook (méthode backslashxx) ==="
+
+SETUID_HOOK="$KSU_DIR/kernel/hook/setuid_hook.c"
+
+if [ -f "$SETUID_HOOK" ]; then
+    echo "Fichier trouvé : $SETUID_HOOK"
+    
+    if grep -q "ksu_seccomp_allow_cache.*__NR_reboot" "$SETUID_HOOK"; then
+        echo "✅ ksu_seccomp_allow_cache(__NR_reboot) déjà présent"
+    else
+        echo "⚠️  Remplacement de disable_seccomp() par ksu_seccomp_allow_cache(__NR_reboot)..."
+        python3 - "$SETUID_HOOK" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+old_block = '''#else
+        disable_seccomp();
+#endif'''
+new_block = '''#else
+        if (current->seccomp.mode == SECCOMP_MODE_FILTER && current->seccomp.filter) {
+            spin_lock_irq(&current->sighand->siglock);
+            ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
+            spin_unlock_irq(&current->sighand->siglock);
+        }
+#endif'''
+
+if old_block in content:
+    content = content.replace(old_block, new_block, 1)
+    with open(path, 'w') as f:
+        f.write(content)
+    print("✅ disable_seccomp() remplacé par ksu_seccomp_allow_cache(__NR_reboot) pour noyau < 5.10")
+else:
+    if 'disable_seccomp();' in content:
+        print("⚠️  Bloc #else exact non trouvé, remplacement direct de disable_seccomp()...")
+        content = content.replace('disable_seccomp();', 
+            '''if (current->seccomp.mode == SECCOMP_MODE_FILTER && current->seccomp.filter) {
+            spin_lock_irq(&current->sighand->siglock);
+            ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
+            spin_unlock_irq(&current->sighand->siglock);
+        }''', 1)
+        with open(path, 'w') as f:
+            f.write(content)
+        print("✅ disable_seccomp() remplacé par ksu_seccomp_allow_cache(__NR_reboot)")
+    else:
+        print("❌ disable_seccomp() non trouvé dans le fichier")
+PYEOF
+    fi
+else
+    echo "⚠️  setuid_hook.c introuvable à $SETUID_HOOK"
+fi
+
+# ==================== 2h. FIX SIDTAB SYNC (COMMIT UPSTREAM a810677) ====================
+echo ""
+echo "=== Fix sidtab sync (commit upstream a810677) ==="
+
+SELINUX_C=$(find "$KSU_DIR" -name "selinux.c" -path "*selinux*" 2>/dev/null | head -1)
+
+if [ -f "$SELINUX_C" ]; then
+    echo "Fichier trouvé : $SELINUX_C"
+    
+    if grep -q "sync to global sidtab" "$SELINUX_C"; then
+        echo "✅ Sync sidtab déjà présente"
+    else
+        echo "⚠️  Sync sidtab absente, injection..."
+        python3 - "$SELINUX_C" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+count = 0
+
+# Pattern 1: my_write_context
+old_pattern = '''length = security_context_to_sid_with_policy(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL);
+    if (length)
+        goto out;'''
+new_pattern = '''length = security_context_to_sid_with_policy(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL);
+    if (length) {
+        goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(buf, size, &tmp, GFP_KERNEL);
+    }'''
+
+if old_pattern in content:
+    content = content.replace(old_pattern, new_pattern, 1)
+    count += 1
+
+# Pattern 2: my_write_access scon
+old_scon = '''length = security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), &ssid, SECSID_NULL, GFP_KERNEL);
+    if (length)
+        goto out;'''
+new_scon = '''length = security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), &ssid, SECSID_NULL, GFP_KERNEL);
+    if (length) {
+        goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(scon, strlen(scon), &tmp, GFP_KERNEL);
+    }'''
+
+if old_scon in content:
+    content = content.replace(old_scon, new_scon, 1)
+    count += 1
+
+# Pattern 3: my_write_access tcon
+old_tcon = '''length = security_context_to_sid_with_policy(backup_sepolicy, tcon, strlen(tcon), &tsid, SECSID_NULL, GFP_KERNEL);
+    if (length)
+        goto out;'''
+new_tcon = '''length = security_context_to_sid_with_policy(backup_sepolicy, tcon, strlen(tcon), &tsid, SECSID_NULL, GFP_KERNEL);
+    if (length) {
+        goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(tcon, strlen(tcon), &tmp, GFP_KERNEL);
+    }'''
+
+if old_tcon in content:
+    content = content.replace(old_tcon, new_tcon, 1)
+    count += 1
+
+# Ajouter tmp dans les déclarations
+if 'u32 sid, len;' in content and 'u32 sid, len, tmp;' not in content:
+    content = content.replace('u32 sid, len;', 'u32 sid, len, tmp;', 1)
+
+if 'u32 ssid, tsid;' in content and 'u32 ssid, tsid, tmp;' not in content:
+    content = content.replace('u32 ssid, tsid;', 'u32 ssid, tsid, tmp;', 1)
+
+if count > 0:
+    with open(path, 'w') as f:
+        f.write(content)
+    print(f"✅ {count} bloc(s) de sync sidtab injecté(s)")
+else:
+    print("⚠️  Aucun pattern correspondant trouvé. Vérifie manuellement le fichier.")
+PYEOF
+    fi
+else
+    echo "⚠️  selinux.c introuvable"
+fi
+
+# ==================== 3. PATCH SUSFS (cyberc3dr) ====================
+echo ""
+echo "=== Patch SUSFS 4.19 (cyberc3dr) ==="
 cd "$GITHUB_WORKSPACE"
-rm -rf /tmp/jack_repo
-git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git /tmp/jack_repo 2>/dev/null || true
+rm -rf /tmp/cyber_repo
+git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Build.git /tmp/cyber_repo 2>/dev/null || true
 
 cd "$GITHUB_WORKSPACE/kernel_sources"
-PATCH_419=$(find /tmp/jack_repo/Patches -name "*4.19*" -name "*.patch" 2>/dev/null | head -1)
+PATCH_419=$(find /tmp/cyber_repo/Patches -name "*4.19*" -name "*.patch" 2>/dev/null | head -1)
 if [ -n "$PATCH_419" ]; then
     patch -p1 < "$PATCH_419" 2>&1 | tail -5 || true
 fi
 find . -name "*.rej" -type f -delete 2>/dev/null || true
-echo "✅ Patch SUSFS appliqué"
+echo "✅ Patch SUSFS (cyberc3dr) appliqué"
 
 # ==================== 3.5. CORRECTIONS POST-PATCH SUSFS ====================
 echo ""
@@ -185,19 +407,73 @@ PYEOF
 fi
 echo "✅ Corrections SUSFS terminées"
 
-# ==================== 4. INJECTION DES HOOKS SOURCES (7 HOOKS) ====================
+# ==================== 4. HOOK CRITIQUE : ksu_handle_sys_reboot (C89) ====================
 echo ""
-echo "=== Injection des hooks sources (SUSFS Inline) ==="
+echo "=== Injection du hook ksu_handle_sys_reboot (DÉTECTION MANAGER) ==="
 
-# Hook 1 : ksu_handle_sys_read
+if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+    python3 << 'PYEOF'
+import re
+with open('kernel/reboot.c', 'r') as f:
+    content = f.read()
+
+if 'ksu_handle_sys_reboot' not in content:
+    pattern_syscall = r'(SYSCALL_DEFINE4\(reboot,\s*int,\s*magic1,\s*int,\s*magic2,\s*unsigned int,\s*cmd,\s*void __user \*,\s*arg\)\s*\{)'
+    match = re.search(pattern_syscall, content)
+    
+    if match:
+        extern = '''
+#if defined(CONFIG_KSU)
+extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);
+#endif
+'''
+        content = content[:match.start()] + extern + content[match.start():]
+        
+        start_pos = content.find('SYSCALL_DEFINE4(reboot')
+        if start_pos != -1:
+            ret_pos = content.find('int ret = 0;', start_pos)
+            if ret_pos != -1:
+                call = '''
+#if defined(CONFIG_KSU)
+	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+#endif'''
+                insert_pos = ret_pos + len('int ret = 0;')
+                content = content[:insert_pos] + call + content[insert_pos:]
+                
+                with open('kernel/reboot.c', 'w') as f:
+                    f.write(content)
+                print("✅ Hook ksu_handle_sys_reboot inséré APRÈS les déclarations (C89 compliant)")
+            else:
+                print("❌ Impossible de trouver 'int ret = 0;' dans la fonction reboot")
+        else:
+            print("❌ Impossible de trouver la fonction reboot après insertion")
+    else:
+        print("❌ Pattern SYSCALL_DEFINE4(reboot) non trouvé")
+else:
+    print("✅ Hook déjà présent")
+PYEOF
+else
+    echo "✅ Hook ksu_handle_sys_reboot déjà présent"
+fi
+
+if grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+    echo "✅ Vérifié : ksu_handle_sys_reboot présent dans kernel/reboot.c"
+else
+    echo "❌ ÉCHEC : ksu_handle_sys_reboot absent de kernel/reboot.c"
+    exit 1
+fi
+
+# ==================== 4b. HOOK CRITIQUE : ksu_handle_sys_read (init.rc) ====================
+echo ""
+echo "=== Injection du hook ksu_handle_sys_read (SUSFS) ==="
+
 if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
   cat > /tmp/h_sys_read.py << 'PYEOF'
 import re
 with open('fs/read_write.c', 'r') as f: content = f.read()
 if 'ksu_handle_sys_read' not in content:
     extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS)
-extern struct static_key_true ksu_is_init_rc_hook_enabled;
+#ifdef CONFIG_KSU_SUSFS
 extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
 #endif
 '''
@@ -208,214 +484,22 @@ extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *c
 {'''
     new_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
 {
-#if defined(CONFIG_KSU_SUSFS)
-	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
-		ksu_handle_sys_read(fd, &buf, &count);
+#ifdef CONFIG_KSU_SUSFS
+	ksu_handle_sys_read(fd, &buf, &count);
 #endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: ksu_handle_sys_read")
+        print("OK: ksu_handle_sys_read injecté (SUSFS)")
 with open('fs/read_write.c', 'w') as f: f.write(content)
 PYEOF
   python3 /tmp/h_sys_read.py
+else
+  echo "[i] Hook sys_read déjà présent"
 fi
 
-# Hook 2 : ksu_handle_input_handle_event
-if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
-  cat > /tmp/h_input.py << 'PYEOF'
-import re
-with open('drivers/input/input.c', 'r') as f: content = f.read()
-if 'ksu_handle_input_handle_event' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS)
-extern struct static_key_true ksu_is_input_hook_enabled;
-extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
-#endif
-'''
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'extern int ksu_handle_input_handle_event' not in content:
-        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
-    old_code = '''void input_event(struct input_dev *dev,
-		 unsigned int type, unsigned int code, int value)
-{
-	unsigned long flags;
-
-	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    new_code = '''void input_event(struct input_dev *dev,
-		 unsigned int type, unsigned int code, int value)
-{
-	unsigned long flags;
-
-#if defined(CONFIG_KSU_SUSFS)
-	if (static_branch_unlikely(&ksu_is_input_hook_enabled))
-		ksu_handle_input_handle_event(&type, &code, &value);
-#endif
-
-	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: ksu_handle_input_handle_event")
-with open('drivers/input/input.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h_input.py
-fi
-
-# Hook 3 : ksu_handle_setresuid
-if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
-  cat > /tmp/h_setresuid.py << 'PYEOF'
-import re
-with open('kernel/sys.c', 'r') as f: content = f.read()
-if 'ksu_handle_setresuid' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS)
-extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
-#endif
-'''
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'extern int ksu_handle_setresuid' not in content:
-        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
-    for marker in ['\tbool ruid_new, euid_new, suid_new;', '\tkuid_t kruid, keuid, ksuid;']:
-        if marker in content:
-            new_code = marker + '''
-#if defined(CONFIG_KSU_SUSFS)
-	(void)ksu_handle_setresuid(ruid, euid, suid);
-#endif'''
-            content = content.replace(marker, new_code, 1)
-            print("OK: ksu_handle_setresuid")
-            break
-with open('kernel/sys.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h_setresuid.py
-fi
-
-# Hook 4 : ksu_handle_execveat (OBLIGATOIRE)
-if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-  cat > /tmp/h_execveat.py << 'PYEOF'
-import re
-with open('fs/exec.c', 'r') as f: content = f.read()
-if 'ksu_handle_execveat' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS)
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
-#endif
-'''
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'extern int ksu_handle_execveat' not in content:
-        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
-    old_code = '''	if (IS_ERR(filename))
-		return PTR_ERR(filename);'''
-    new_code = '''	if (IS_ERR(filename))
-		return PTR_ERR(filename);
-
-#if defined(CONFIG_KSU_SUSFS)
-	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: ksu_handle_execveat")
-with open('fs/exec.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h_execveat.py
-fi
-
-# Hook 5 : ksu_handle_faccessat (OBLIGATOIRE)
-if ! grep -q "ksu_handle_faccessat" fs/open.c; then
-  cat > /tmp/h_faccessat.py << 'PYEOF'
-import re
-with open('fs/open.c', 'r') as f: content = f.read()
-if 'ksu_handle_faccessat' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS)
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
-#endif
-'''
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'extern int ksu_handle_faccessat' not in content:
-        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
-    old_code = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-{
-	return do_faccessat(dfd, filename, mode);'''
-    new_code = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-{
-#if defined(CONFIG_KSU_SUSFS)
-	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-#endif
-	return do_faccessat(dfd, filename, mode);'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: ksu_handle_faccessat")
-with open('fs/open.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h_faccessat.py
-fi
-
-# Hook 6 : ksu_handle_stat (OBLIGATOIRE)
-if ! grep -q "ksu_handle_stat" fs/stat.c; then
-  cat > /tmp/h_stat.py << 'PYEOF'
-import re
-with open('fs/stat.c', 'r') as f: content = f.read()
-if 'ksu_handle_stat' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS)
-extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
-extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
-#endif
-'''
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'extern int ksu_handle_stat' not in content:
-        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
-    old_code = '''	struct kstat stat;
-	int error;
-
-	return vfs_fstatat(dfd, filename, &stat, flag);'''
-    new_code = '''	struct kstat stat;
-	int error;
-
-#if defined(CONFIG_KSU_SUSFS)
-	ksu_handle_stat(&dfd, &filename, &flag);
-#endif
-	return vfs_fstatat(dfd, filename, &stat, flag);'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: ksu_handle_stat")
-with open('fs/stat.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h_stat.py
-fi
-
-# Hook 7 : ksu_handle_sys_reboot (OBLIGATOIRE)
-if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
-  cat > /tmp/h_reboot.py << 'PYEOF'
-import re
-with open('kernel/reboot.c', 'r') as f: content = f.read()
-if 'ksu_handle_sys_reboot' not in content:
-    extern_decl = '''
-#if defined(CONFIG_KSU_SUSFS)
-extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
-#endif
-'''
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'extern int ksu_handle_sys_reboot' not in content:
-        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
-    old_code = '''	char buffer[256];
-	int ret = 0;'''
-    new_code = '''	char buffer[256];
-	int ret = 0;
-
-#if defined(CONFIG_KSU_SUSFS)
-	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: ksu_handle_sys_reboot")
-with open('kernel/reboot.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h_reboot.py
-fi
-
-# ==================== 5. CONFIGURATION ====================
+# ==================== 5. CONFIGURATION (SUSFS + SECCOMP) ====================
 echo ""
-echo "=== Configuration (SUSFS Inline) ==="
+echo "=== Configuration (SUSFS pur + SECCOMP) ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -424,23 +508,28 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 {
   echo "CONFIG_KSU=y"
-  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
-  echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
   echo "CONFIG_KSU_SUSFS=y"
-  echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-  echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-  echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-  echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-  echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-  echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+  echo "# CONFIG_KSU_TAMPER_SYSCALL_TABLE is not set"
+  echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
+  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
+  echo "CONFIG_KPROBES=y"
+  echo "CONFIG_HAVE_KPROBES=y"
+  echo "CONFIG_KRETPROBES=y"
+  echo "CONFIG_SECCOMP=y"
+  echo "CONFIG_SECCOMP_FILTER=y"
   echo "CONFIG_COMPAT=y"
   echo "CONFIG_COMPAT_32BIT_TIME=y"
 } >> out/.config
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
+
+echo "=== État final .config ==="
+grep -E "KSU_MANUAL_HOOK|KSU_SUSFS|KSU_TRACEPOINT|KSU_TAMPER|KPROBES|SECCOMP" out/.config | head -20 || true
+
+if ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
+    echo "❌ CONFIG_KSU_SUSFS non activé, abandon"
+    exit 1
+fi
 
 # ==================== 6. PATCHS MOTOROLA ====================
 echo "=== Patch signatures + tactile ==="
@@ -461,9 +550,9 @@ else
     exit 1
 fi
 
-# ==================== 8. COMPILATION KSUD (SYNC-SUSFS) ====================
+# ==================== 8. COMPILATION KSUD (BakaSU sync-susfs) ====================
 echo ""
-echo "=== Compilation ksud (sync-susfs) ==="
+echo "=== Compilation ksud (BakaSU sync-susfs) ==="
 cd "$GITHUB_WORKSPACE"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -495,9 +584,9 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé (sync-susfs)"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 9. REPACK AVEC INJECTION INIT.RC ====================
+# ==================== 9. REPACK (MÉTHODE BACKSLASHXX) ====================
 echo ""
-echo "=== Repack avec injection init.rc + allow_shell ==="
+echo "=== Repack (méthode backslashxx : magiskboot cpio add) ==="
 
 rm -f boot-stock.img
 if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
@@ -511,137 +600,8 @@ gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 
 
 mkdir -p repack
 cp boot-stock.img repack/boot.img
-cp "$GITHUB_WORKSPACE/ksud" repack/ksud
 wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O Magisk-v27.0.apk
 unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so
 mv lib/x86_64/libmagiskboot.so repack/magiskboot
 chmod +x repack/magiskboot
-rm -rf Magisk-v27.0.apk lib/
-cd repack
-
-./magiskboot unpack boot.img
-if [ ! -f "kernel" ] || [ ! -f "ramdisk.cpio" ]; then
-    echo "❌ Échec unpack"; exit 1
-fi
-
-cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
-
-if [ -f "header" ]; then
-    echo "→ Ajout de allow_shell=1 à la cmdline dans le header"
-    python3 - << 'PYEOF'
-with open('header', 'r+b') as f:
-    header = f.read()
-    cmdline_offset = 44
-    cmdline = header[cmdline_offset:cmdline_offset+512].split(b'\x00')[0].decode('utf-8', errors='ignore')
-    if 'allow_shell' not in cmdline:
-        new_cmdline = cmdline + ' kernelsu.allow_shell=1 allow_shell=1'
-        new_bytes = new_cmdline.encode('utf-8')
-        f.seek(cmdline_offset)
-        f.write(new_bytes + b'\x00' * (512 - len(new_bytes)))
-        print("  ✅ Cmdline patchée dans header")
-PYEOF
-fi
-
-rm -rf initrc_work
-mkdir -p initrc_work
-cd initrc_work
-cpio -idm < ../ramdisk.cpio 2>/dev/null || true
-INITRC_PATH=$(find . -name "init.rc" -type f 2>/dev/null | head -1)
-echo "init.rc trouvé : $INITRC_PATH"
-
-if [ -n "$INITRC_PATH" ] && [ -f "$INITRC_PATH" ]; then
-    cat >> "$INITRC_PATH" << 'INITRC_EOF'
-
-# --- KSUD START ---
-on post-fs-data
-    exec u:r:su:s0 root -- /system/bin/ksud post-fs-data
-
-on nonencrypted
-    exec u:r:su:s0 root -- /system/bin/ksud services
-
-on property:vold.decrypt=trigger_restart_framework
-    exec u:r:su:s0 root -- /system/bin/ksud services
-
-on property:sys.boot_completed=1
-    exec u:r:su:s0 root -- /system/bin/ksud boot-completed
-# --- KSUD END ---
-INITRC_EOF
-    echo "✅ init.rc modifié"
-else
-    echo "⚠️ init.rc introuvable — création d'un nouvel init.rc"
-    cat > init.rc << 'INITRC_EOF'
-# --- KSUD START ---
-on post-fs-data
-    exec u:r:su:s0 root -- /system/bin/ksud post-fs-data
-
-on nonencrypted
-    exec u:r:su:s0 root -- /system/bin/ksud services
-
-on property:vold.decrypt=trigger_restart_framework
-    exec u:r:su:s0 root -- /system/bin/ksud services
-
-on property:sys.boot_completed=1
-    exec u:r:su:s0 root -- /system/bin/ksud boot-completed
-# --- KSUD END ---
-INITRC_EOF
-    INITRC_PATH="init.rc"
-    echo "✅ init.rc créé"
-fi
-
-mkdir -p system/bin
-cp ../ksud system/bin/ksud
-chmod 755 system/bin/ksud
-echo "✅ ksud ajouté à system/bin"
-
-echo "→ Reconstruction du ramdisk..."
-find . | cpio -o -H newc 2>/dev/null | gzip -9 > ../ramdisk.cpio
-cd ..
-
-echo "→ Repack du boot.img..."
-./magiskboot repack boot.img new-boot.img
-if [ ! -f "new-boot.img" ]; then
-    echo "❌ Échec repack"; exit 1
-fi
-mv new-boot.img ../final_boot.img
-cd ..
-
-# ==================== 10. DIAGNOSTIC ====================
-echo ""
-echo "=== DIAGNOSTIC ==="
-mkdir -p verify; cd verify
-cp ../final_boot.img verify_boot.img
-../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
-if [ -f "kernel" ]; then
-    HASH_EXTRACTED=$(sha256sum kernel | cut -d' ' -f1)
-    HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
-    [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ] && echo "✅ Noyau IDENTIQUE"
-fi
-
-if [ -f "ramdisk.cpio" ]; then
-    mkdir -p ramdisk_check
-    cd ramdisk_check
-    cpio -idm < ../ramdisk.cpio 2>/dev/null || true
-    if [ -f "system/bin/ksud" ]; then
-        echo "  ✅ ksud présent dans system/bin/"
-    else
-        echo "  ❌ ksud absent"
-    fi
-    INITRC_CHECK=$(find . -name "init.rc" -type f 2>/dev/null | head -1)
-    if [ -n "$INITRC_CHECK" ] && grep -q "KSUD START" "$INITRC_CHECK"; then
-        echo "  ✅ init.rc contient KSUD START"
-    else
-        echo "  ❌ init.rc ne contient pas KSUD START"
-    fi
-    cd ..
-fi
-cd ..
-
-# ==================== 11. SORTIE ====================
-mkdir -p output
-cp final_boot.img output/BakaSU-SyncSusFS-v18-boot.img
-cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
-cp kernel_sources/build.log output/
-cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
-echo ""
-echo "=== BUILD TERMINÉ v18 (sync-susfs + patch SUSFS + 7 hooks) ==="
-ls -lh output/
+rm
