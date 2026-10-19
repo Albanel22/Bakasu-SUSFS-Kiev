@@ -209,9 +209,11 @@ PYEOF
 echo ""
 echo "=== Bypass seccomp du supercall KSU (arch/arm64/kernel/ptrace.c) ==="
 KSU_MAGIC=$(grep -rhoE "KSU_INSTALL_MAGIC1[[:space:]]+(0x)?[0-9A-Fa-f]+" "$KSU_DIR" 2>/dev/null | head -1 | grep -oE "0x[0-9A-Fa-f]+" || true)
+echo "--- candidats magie supercall dans le driver ---" >> "$REPORT"
+grep -rniE "0xdeadbeef|INSTALL_MAGIC|SUPERCALL_MAGIC|KSU_MAGIC" "$KSU_DIR" 2>/dev/null | head -15 >> "$REPORT" || true
 if [ -z "$KSU_MAGIC" ]; then
-    KSU_MAGIC="0xDEADBEEF"
-    echo "⚠️  KSU_INSTALL_MAGIC1 non trouvé dans le driver, valeur par défaut $KSU_MAGIC" | tee -a "$REPORT"
+    KSU_MAGIC="ANY"
+    echo "⚠️  KSU_INSTALL_MAGIC1 non trouvé : mode ANY (tout reboot dont magic1 != 0xfee1dead passe seccomp ; ce n'est jamais un vrai reboot)" | tee -a "$REPORT"
 else
     echo "KSU_INSTALL_MAGIC1 = $KSU_MAGIC (lu dans le driver)" | tee -a "$REPORT"
 fi
@@ -234,6 +236,7 @@ if 'secure_computing(NULL)' not in body:
 new_body = body.replace('secure_computing(NULL)',
                         '(ksu_seccomp_bypass(regs) ? 0 : secure_computing(NULL))')
 
+cond = '(u32)regs->regs[0] != 0xfee1deadU' if magic == 'ANY' else '(u32)regs->regs[0] == %sU' % magic
 helper = '''#ifdef CONFIG_KSU
 #include <asm/unistd.h>
 /*
@@ -243,13 +246,13 @@ helper = '''#ifdef CONFIG_KSU
  */
 static inline bool ksu_seccomp_bypass(struct pt_regs *regs)
 {
-	return regs->syscallno == __NR_reboot && (u32)regs->regs[0] == %sU;
+	return regs->syscallno == __NR_reboot && %s;
 }
 #else
 static inline bool ksu_seccomp_bypass(struct pt_regs *regs) { return false; }
 #endif
 
-''' % magic
+''' % cond
 
 c = c[:fn.start()] + helper + c[fn.start():fn.end()] + new_body + c[end:]
 open(p, 'w').write(c)
@@ -289,8 +292,8 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 } >> out/.config
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
-grep -E "CONFIG_KSU|KPROBES|SECCOMP|KALLSYMS" out/.config > output/dotconfig-ksu.txt || true
-cat output/dotconfig-ksu.txt
+grep -E "CONFIG_KSU|KPROBES|SECCOMP|KALLSYMS" out/.config > "$GITHUB_WORKSPACE/output/dotconfig-ksu.txt" || true
+cat "$GITHUB_WORKSPACE/output/dotconfig-ksu.txt"
 # Fail-closed : v26 ne contrôlait que KSU_SUSFS ; on contrôle aussi KSU lui-même
 for opt in CONFIG_KSU=y CONFIG_KSU_SUSFS=y CONFIG_SECCOMP_FILTER=y; do
     grep -q "^${opt}$" out/.config || { echo "❌ ${opt} absent du .config final"; exit 1; }
