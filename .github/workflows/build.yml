@@ -1,4 +1,4 @@
-name: Build ReSukiSU Kernel
+name: Build BakaSU Kernel
 
 on:
   workflow_dispatch:
@@ -10,10 +10,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        
       - name: Run build script
-        run: bash build.sh
+        run: bash scripts/build_kernel.sh
+        
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: ReSukiSU-kiev
+          name: BakaSU-SUSFS-kiev
           path: output/*
