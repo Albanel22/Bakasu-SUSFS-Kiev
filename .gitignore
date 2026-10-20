@@ -1,0 +1,4 @@
+*.img
+*.zip
+out/
+kernel_sources/
