@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # =============================================================================
-# V29 : BakaSU main + patch cyberc3dr + REPACK BACKSLASHXX
+# V30 : BakaSU main + patch SUSFS JackA1ltman + REPACK BACKSLASHXX
 #       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89)
 #       + FIX SECCOMP (ksu_seccomp_allow_cache)
 #       + FIX SIDTAB SYNC (commit upstream a810677)
 # =============================================================================
 
-echo "=== Build BakaSU (main + repack backslashxx + sidtab sync) v29 ==="
+echo "=== Build BakaSU (main + patch JackA1ltman + sidtab sync) v30 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -340,20 +340,37 @@ else
     echo "⚠️  selinux.c introuvable"
 fi
 
-# ==================== 3. PATCH SUSFS (cyberc3dr) ====================
+# ==================== 3. PATCH SUSFS (JackA1ltman) ====================
 echo ""
-echo "=== Patch SUSFS 4.19 (cyberc3dr) ==="
+echo "=== Patch SUSFS 4.19 (JackA1ltman) ==="
 cd "$GITHUB_WORKSPACE"
-rm -rf /tmp/cyber_repo 2>/dev/null || true
-git clone --depth=1 --branch rebase https://github.com/cyberc3dr/nGKI_Kernel_Build.git /tmp/cyber_repo 2>/dev/null || true
+rm -rf /tmp/jack_repo 2>/dev/null || true
+git clone --depth=1 --branch mainline https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git /tmp/jack_repo 2>/dev/null || true
 
 cd "$GITHUB_WORKSPACE/kernel_sources"
-PATCH_419=$(find /tmp/cyber_repo/Patches -name "*4.19*" -name "*.patch" 2>/dev/null | head -1 || true)
-if [ -n "$PATCH_419" ]; then
-    patch -p1 < "$PATCH_419" 2>&1 | tail -5 || true
+PATCH_419="/tmp/jack_repo/Patches/Patch/susfs_patch_to_4.19.patch"
+
+if [ -f "$PATCH_419" ]; then
+    echo "Application du patch : $PATCH_419"
+    patch -p1 < "$PATCH_419" 2>&1 | tee /tmp/jack_patch.log | tail -20 || true
+else
+    echo "❌ Patch JackA1ltman introuvable à l'emplacement prévu."
+    echo "   Contenu de /tmp/jack_repo/Patches/Patch/ :"
+    ls /tmp/jack_repo/Patches/Patch/ 2>/dev/null | head -20 || true
 fi
+
+# Nettoyage des .rej et .orig
+REJ_COUNT=$(find . -name "*.rej" -type f 2>/dev/null | wc -l)
+if [ "$REJ_COUNT" -gt 0 ]; then
+    echo "⚠️  $REJ_COUNT fichier(s) .rej généré(s) par le patch JackA1ltman."
+    echo "   Fichiers concernés :"
+    find . -name "*.rej" -type f 2>/dev/null
+    echo "   Le build peut échouer si les rejets ne sont pas résolus manuellement."
+fi
+
 find . -name "*.rej" -type f -delete 2>/dev/null || true
-echo "✅ Patch SUSFS (cyberc3dr) appliqué"
+find . -name "*.orig" -type f -delete 2>/dev/null || true
+echo "✅ Patch SUSFS (JackA1ltman) appliqué (vérifie les rejets ci-dessus)"
 
 # ==================== 3.5. CORRECTIONS POST-PATCH SUSFS ====================
 echo ""
@@ -650,10 +667,10 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFS-v29-boot.img
+cp final_boot.img output/BakaSU-SUSFS-v30-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v29 ==="
+echo "=== BUILD TERMINÉ v30 ==="
 ls -lh output/
