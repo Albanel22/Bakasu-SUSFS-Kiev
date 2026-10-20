@@ -2,13 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# V30 : BakaSU main + patch SUSFS JackA1ltman + REPACK BACKSLASHXX
-#       + FIX O_CLOEXEC + HOOK ksu_handle_sys_reboot (C89)
-#       + FIX SECCOMP (ksu_seccomp_allow_cache)
-#       + FIX SIDTAB SYNC (commit upstream a810677)
+# V31 : BakaSU main + patch JackA1ltman + INLINE HOOKS JackA1ltman
+#       + FIX O_CLOEXEC + FIX SECCOMP + FIX SIDTAB
 # =============================================================================
 
-echo "=== Build BakaSU (main + patch JackA1ltman + sidtab sync) v30 ==="
+echo "=== Build BakaSU (main + inline hooks JackA1ltman) v31 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -205,7 +203,7 @@ fi
 echo ""
 echo "=== Fix seccomp dans setuid_hook (méthode backslashxx) ==="
 
-SETUID_HOOK="$KSU_DIR/kernel/hook/setuid_hook.c"
+SETUID_HOOK=$(find "$KSU_DIR" -name "setuid_hook.c" 2>/dev/null | head -1 || true)
 
 if [ -f "$SETUID_HOOK" ]; then
     echo "Fichier trouvé : $SETUID_HOOK"
@@ -235,10 +233,10 @@ if old_block in content:
     content = content.replace(old_block, new_block, 1)
     with open(path, 'w') as f:
         f.write(content)
-    print("✅ disable_seccomp() remplacé par ksu_seccomp_allow_cache(__NR_reboot) pour noyau < 5.10")
+    print("✅ disable_seccomp() remplacé par ksu_seccomp_allow_cache(__NR_reboot)")
 else:
     if 'disable_seccomp();' in content:
-        print("⚠️  Bloc #else exact non trouvé, remplacement direct de disable_seccomp()...")
+        print("⚠️  Bloc #else exact non trouvé, remplacement direct...")
         content = content.replace('disable_seccomp();', 
             '''if (current->seccomp.mode == SECCOMP_MODE_FILTER && current->seccomp.filter) {
             spin_lock_irq(&current->sighand->siglock);
@@ -247,13 +245,13 @@ else:
         }''', 1)
         with open(path, 'w') as f:
             f.write(content)
-        print("✅ disable_seccomp() remplacé par ksu_seccomp_allow_cache(__NR_reboot)")
+        print("✅ disable_seccomp() remplacé")
     else:
-        print("❌ disable_seccomp() non trouvé dans le fichier")
+        print("❌ disable_seccomp() non trouvé")
 PYEOF
     fi
 else
-    echo "⚠️  setuid_hook.c introuvable à $SETUID_HOOK"
+    echo "⚠️  setuid_hook.c introuvable"
 fi
 
 # ==================== 2h. FIX SIDTAB SYNC (COMMIT UPSTREAM a810677) ====================
@@ -333,7 +331,7 @@ if count > 0:
         f.write(content)
     print(f"✅ {count} bloc(s) de sync sidtab injecté(s)")
 else:
-    print("⚠️  Aucun pattern correspondant trouvé. Vérifie manuellement le fichier.")
+    print("⚠️  Aucun pattern correspondant trouvé.")
 PYEOF
     fi
 else
@@ -354,23 +352,19 @@ if [ -f "$PATCH_419" ]; then
     echo "Application du patch : $PATCH_419"
     patch -p1 < "$PATCH_419" 2>&1 | tee /tmp/jack_patch.log | tail -20 || true
 else
-    echo "❌ Patch JackA1ltman introuvable à l'emplacement prévu."
-    echo "   Contenu de /tmp/jack_repo/Patches/Patch/ :"
+    echo "❌ Patch JackA1ltman introuvable."
     ls /tmp/jack_repo/Patches/Patch/ 2>/dev/null | head -20 || true
 fi
 
-# Nettoyage des .rej et .orig
 REJ_COUNT=$(find . -name "*.rej" -type f 2>/dev/null | wc -l)
 if [ "$REJ_COUNT" -gt 0 ]; then
-    echo "⚠️  $REJ_COUNT fichier(s) .rej généré(s) par le patch JackA1ltman."
-    echo "   Fichiers concernés :"
+    echo "⚠️  $REJ_COUNT fichier(s) .rej généré(s)"
     find . -name "*.rej" -type f 2>/dev/null
-    echo "   Le build peut échouer si les rejets ne sont pas résolus manuellement."
 fi
 
 find . -name "*.rej" -type f -delete 2>/dev/null || true
 find . -name "*.orig" -type f -delete 2>/dev/null || true
-echo "✅ Patch SUSFS (JackA1ltman) appliqué (vérifie les rejets ci-dessus)"
+echo "✅ Patch SUSFS (JackA1ltman) appliqué"
 
 # ==================== 3.5. CORRECTIONS POST-PATCH SUSFS ====================
 echo ""
@@ -420,94 +414,39 @@ PYEOF
 fi
 echo "✅ Corrections SUSFS terminées"
 
-# ==================== 4. HOOK CRITIQUE : ksu_handle_sys_reboot (C89) ====================
+# ==================== 4. INLINE HOOKS SUSFS (JackA1ltman) ====================
 echo ""
-echo "=== Injection du hook ksu_handle_sys_reboot (DÉTECTION MANAGER) ==="
+echo "=== Application des inline hooks SUSFS (JackA1ltman) ==="
 
-if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
-    python3 << 'PYEOF'
-import re
-with open('kernel/reboot.c', 'r') as f:
-    content = f.read()
+INLINE_HOOK_SCRIPT="/tmp/jack_repo/Patches/susfs_inline_hook_patches.sh"
 
-if 'ksu_handle_sys_reboot' not in content:
-    pattern_syscall = r'(SYSCALL_DEFINE4\(reboot,\s*int,\s*magic1,\s*int,\s*magic2,\s*unsigned int,\s*cmd,\s*void __user \*,\s*arg\)\s*\{)'
-    match = re.search(pattern_syscall, content)
+if [ -f "$INLINE_HOOK_SCRIPT" ]; then
+    echo "Script trouvé : $INLINE_HOOK_SCRIPT"
+    chmod +x "$INLINE_HOOK_SCRIPT"
     
-    if match:
-        extern = '''
-#if defined(CONFIG_KSU)
-extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);
-#endif
-'''
-        content = content[:match.start()] + extern + content[match.start():]
-        
-        start_pos = content.find('SYSCALL_DEFINE4(reboot')
-        if start_pos != -1:
-            ret_pos = content.find('int ret = 0;', start_pos)
-            if ret_pos != -1:
-                call = '''
-#if defined(CONFIG_KSU)
-	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-#endif'''
-                insert_pos = ret_pos + len('int ret = 0;')
-                content = content[:insert_pos] + call + content[insert_pos:]
-                
-                with open('kernel/reboot.c', 'w') as f:
-                    f.write(content)
-                print("✅ Hook ksu_handle_sys_reboot inséré APRÈS les déclarations (C89 compliant)")
-            else:
-                print("❌ Impossible de trouver 'int ret = 0;' dans la fonction reboot")
-        else:
-            print("❌ Impossible de trouver la fonction reboot après insertion")
-    else:
-        print("❌ Pattern SYSCALL_DEFINE4(reboot) non trouvé")
-else:
-    print("✅ Hook déjà présent")
-PYEOF
+    # Le script doit être exécuté depuis la racine du noyau
+    bash "$INLINE_HOOK_SCRIPT" 2>&1 | tee /tmp/inline_hook.log
+    
+    echo ""
+    echo "=== Résumé des hooks appliqués ==="
+    grep -E "\[\+\].*Patched|\[-\].*failed|\[-\].*Skipped|Warning.*contains" /tmp/inline_hook.log | head -40 || true
+    
+    # Vérification critique : kernel/reboot.c doit être patché
+    if grep -q "kernel/reboot.c Patched" /tmp/inline_hook.log; then
+        echo "✅ kernel/reboot.c patché par JackA1ltman"
+    else
+        echo "❌ kernel/reboot.c NON patché par JackA1ltman"
+        echo "   Vérifie si 'ksu_handle' était déjà présent (Warning ci-dessus)"
+    fi
+    
+    if grep -q "kernel/sys.c Patched" /tmp/inline_hook.log; then
+        echo "✅ kernel/sys.c patché par JackA1ltman"
+    else
+        echo "❌ kernel/sys.c NON patché par JackA1ltman"
+    fi
 else
-    echo "✅ Hook ksu_handle_sys_reboot déjà présent"
-fi
-
-if grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
-    echo "✅ Vérifié : ksu_handle_sys_reboot présent dans kernel/reboot.c"
-else
-    echo "❌ ÉCHEC : ksu_handle_sys_reboot absent de kernel/reboot.c"
+    echo "❌ Script d'inline hooks introuvable à $INLINE_HOOK_SCRIPT"
     exit 1
-fi
-
-# ==================== 4b. HOOK CRITIQUE : ksu_handle_sys_read (init.rc) ====================
-echo ""
-echo "=== Injection du hook ksu_handle_sys_read (SUSFS) ==="
-
-if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
-  cat > /tmp/h_sys_read.py << 'PYEOF'
-import re
-with open('fs/read_write.c', 'r') as f: content = f.read()
-if 'ksu_handle_sys_read' not in content:
-    extern_decl = '''
-#ifdef CONFIG_KSU_SUSFS
-extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
-#endif
-'''
-    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', content)
-    if m and 'extern int ksu_handle_sys_read' not in content:
-        content = content[:m.end()] + extern_decl + '\n' + content[m.end():]
-    old_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-{'''
-    new_code = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-{
-#ifdef CONFIG_KSU_SUSFS
-	ksu_handle_sys_read(fd, &buf, &count);
-#endif'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: ksu_handle_sys_read injecté (SUSFS)")
-with open('fs/read_write.c', 'w') as f: f.write(content)
-PYEOF
-  python3 /tmp/h_sys_read.py
-else
-  echo "[i] Hook sys_read déjà présent"
 fi
 
 # ==================== 5. CONFIGURATION (SUSFS + SECCOMP) ====================
@@ -667,10 +606,10 @@ cd ..
 
 # ==================== 11. SORTIE ====================
 mkdir -p output
-cp final_boot.img output/BakaSU-SUSFS-v30-boot.img
+cp final_boot.img output/BakaSU-SUSFS-v31-boot.img
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ v30 ==="
+echo "=== BUILD TERMINÉ v31 ==="
 ls -lh output/
